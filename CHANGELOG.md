@@ -1,5 +1,6 @@
 # Changelog — omp-harness 1.2.0
 
+- Watchdog target extraction now unwraps markdown-decorated paths (backticks, bold, link form, trailing colon) so a markdown `# Target` no longer escapes scope checking; glob tokens are still rejected.
 - Routing scores only user prose: `extractUserPrompt` strips `<critical>`, `<system-reminder>`, `<zero-mem-recall>`, `<parent-read-ledger>`, `<superagent-watchdog>` envelopes and `[IMPORTANT: User invoked the ...]` lines before `classifyTaskCategory` / `scoreSkillDocs`. Explicit `/skill:<name>` and `skill://<name>` invocations are captured and boosted +0.25, outranking MiniSearch recall.
 - Length damping engages only past ~16 matched terms (`Math.max(1, log2(n/8))`) so oversized prompts cannot saturate every skill to 1.00 while ordinary prompts keep the calibrated curve and stay above the pointer floor.
 - `decideValve`: an already-injected top candidate closes the valve as `already-injected` instead of walking down the list; a margin under 0.03 closes the valve even at `>= 0.85` confidence, so saturated ties never autoload.

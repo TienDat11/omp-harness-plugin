@@ -480,8 +480,32 @@ test("extractTargetPaths rejects prose with no real path", () => {
   assert.deepEqual(extractTargetPaths("try/catch block"), []);
 });
 
-test("extractTargetPaths rejects markdown-wrapped path in prose", () => {
-  assert.deepEqual(extractTargetPaths("**`src/read-budget.ts`**:"), []);
+test("extractTargetPaths unwraps markdown-wrapped target paths", () => {
+  // Markdown decoration (backticks, bold markers, trailing colon) is unwrapped
+  // so a markdown # Target no longer escapes watchdog scope checking.
+  assert.deepEqual(extractTargetPaths("**`src/read-budget.ts`**:"), [nk("src/read-budget.ts")]);
+});
+
+test("extractTargetPaths packet branch still targets # Target only", () => {
+  // Non-regression: packet inputs yield paths from input.target only, never
+  // from change/acceptance prose.
+  assert.deepEqual(
+    extractTargetPaths({
+      target: "d:/omp-harness/src/stack-router.ts",
+      change: "try/catch in `src/noise.ts`",
+      acceptance: ["`src/noise2.ts` passes"],
+      stop: "none",
+    }),
+    ["d:/omp-harness/src/stack-router.ts"],
+  );
+});
+
+test("extractTargetPaths rejects glob tokens", () => {
+  assert.deepEqual(extractTargetPaths("*.ts"), []);
+});
+
+test("extractTargetPaths rejects prose with no real path", () => {
+  assert.deepEqual(extractTargetPaths("try/catch block"), []);
 });
 
 test("extractTargetPaths deduplicates", () => {

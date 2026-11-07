@@ -438,14 +438,23 @@ export function isInternalSchemePath(input: string): boolean {
   return STRIP_SCHEME_RE.test(trimmed);
 }
 
+function unwrapMarkdown(token: string): string {
+  const m = token.match(/^\[([^\]]+)\]\([^)]*\)$/);
+  if (m) return m[1].trim();
+  let out = token;
+  out = out.replace(/`/g, "");
+  out = out.replace(/^\*{1,2}|^\_{1,2}|^~{1,2}/, "");
+  out = out.replace(/[,;:]+$/, "");
+  out = out.replace(/\*{1,2}$|\_{1,2}$|~{1,2}$/, "");
+  out = out.replace(/^\[\[?/, "").replace(/\]\]?$/, "");
+  out = out.replace(/^\(|\)$/g, "");
+  out = out.replace(/^["'<]+|["'>]+$/g, "");
+  out = out.replace(/[,;:]+$/, "");
+  return out.trim();
+}
+
 function stripPathNoise(path: string): string {
-  return path
-    .replace(/^`+|`+$/g, "")
-    .replace(/^"|"$/g, "")
-    .replace(/^'|'$/g, "")
-    .replace(/^(?:\*\*|__)/, "")
-    .replace(/(?:\*\*|__)$/, "")
-    .replace(/^[*_\s"'()\[\]<>,;.\`]+|[\s*_"'()\[\]<>,;.\`]+$/g, "")
+  return unwrapMarkdown(path)
     .replace(/^\[|]$/g, "")
     .replace(/#.*$/, "")
     .replace(/(?::\d+(?:-\d+)?)$/, "")

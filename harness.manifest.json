@@ -32,7 +32,7 @@
     "src/skill-telemetry.ts": "b4b3443095b9cd342de6764aec019a3879cfdf50774834a93089d73968d8c67f",
     "src/stack-router.ts": "cdfd6a8d0d9649ef9d6ac91e72d23025acba211a9ad3e858a8d86f40832536f5",
     "src/state.ts": "4ed0cf4f91971b4fac1e9f3ff6146c5c6722dd564e2a2df80661c76295dcc580",
-    "src/superagent.ts": "2adf655c9d9e03c413e58f31d25054702fd8a803197bb0085d1cc68bba310738",
+    "src/superagent.ts": "883441633d2cc7c2fc40de2ec980a1850ab99bf3eaa074eead1eea6f4d1ccc45",
     "src/telemetry.ts": "820471b12952ddd671638a6b9eb7c794cfeb41928c2110e53ced62f5f1308001",
     "src/tools.ts": "b70451f83a240c98f330e694d3c5b6d820234359003551b3455bfdc2d9f33cd1",
     "src/verify-gate.ts": "a005f1e7d67d44a0d8195367109b5ff79f52669dead6b27170e33639f4089851",
