@@ -498,3 +498,7 @@ The following are deliberately excluded from the public repository via `.gitigno
 - Root analysis reports: `OMP-VS-DSH-ARCHITECTURE-CONTEXT.md`, `OSS-BLUEPRINT-dsh-superagent-prototype.md`, `goldfish_review_report.md`, `concepts_brief.md`.
 
 The public repository carries `src/`, `config/`, `skills/`, `agents/`, `scripts/`, `tests/`, `harness.manifest.json`, and this README. There are no `docs/` links in this README; references to local-only material are plain text.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The `vendor/zero-mem` submodule is third-party code under its own upstream license and is not covered by this repository's MIT grant.
