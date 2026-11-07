@@ -1,0 +1,32 @@
+# Local harness state and generated evidence
+.omp/
+.ua/
+
+# Dependencies
+node_modules/
+
+# Technical documents kept local, never published
+docs/
+OMP-VS-DSH-ARCHITECTURE-CONTEXT.md
+OSS-BLUEPRINT-dsh-superagent-prototype.md
+goldfish_review_report.md
+concepts_brief.md
+
+# Probe definitions and run results (large, machine-specific)
+probes/
+
+# Build/test artefacts
+*.log
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.jsonl
+*.bak
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+
+# OS/editor
+.DS_Store
+Thumbs.db

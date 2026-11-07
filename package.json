@@ -1,0 +1,37 @@
+{
+  "name": "@local/omp-adaptive-harness",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic, evidence-driven harness for omp: tool policy, session telemetry, bounded shadow Jev decisions, structured outcomes and gated learning.",
+  "engines": {
+    "node": ">=24"
+  },
+  "omp": {
+    "extensions": [
+      "./src/policy.ts",
+      "./src/intake.ts",
+      "./src/tools.ts",
+      "./src/memory.ts",
+      "./src/verify-gate.ts",
+      "./src/stack-router.ts",
+      "./src/superagent.ts"
+    ]
+  },
+  "files": ["src/", "scripts/", "skills/", "agents/", "config/", "py/", "vendor/", "!vendor/**/__pycache__/", "!vendor/**/*.pyc", "docs/", "harness.manifest.json", "README.md"],
+  "scripts": {
+    "test": "node --test",
+    "verify": "node scripts/verify.mjs",
+    "probes": "node scripts/run-probes.mjs",
+    "compare": "node scripts/compare.mjs"
+  },
+  "dependencies": {
+    "@typesafe-ai/sdk": "0.7.0",
+    "graphology": "0.26.0",
+    "graphology-metrics": "2.4.2",
+    "minisearch": "7.2.0"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^18.14.1"
+  }
+}

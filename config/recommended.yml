@@ -1,0 +1,73 @@
+# Documented settings overlay for omp. Applied over ~/.omp/agent/config.yml.
+# Changes routing and guardrail policy only; never provider credentials.
+# muse2api/muse-chat stays a dormant manual modelRoles.advisor selector; with
+# advisor disabled it must generate no automatic requests.
+
+task:
+  eager: preferred            # spawn on demand, not always
+  enableEffort: false
+  maxRecursionDepth: 1
+  maxConcurrency: 4            # bounded parallel tasks
+  softRequestBudget: 24
+  maxRuntimeMs: 900000
+  completionProbe: false
+  agentPrewalk:               # prewalk hands off after first edit; wrong for debugging and security work
+    session-orchestrator: "off"
+    coder: "off"
+    task: "off"
+    sonic: "off"
+    scout: "off"
+    researcher: "off"
+    reviewer: "off"
+    security-reviewer: "off"
+    debugger: "off"
+  agentAdvisor:               # no automatic advisor request on any agent
+    session-orchestrator: "off"
+    coder: "off"
+    task: "off"
+    sonic: "off"
+    scout: "off"
+    researcher: "off"
+    reviewer: "off"
+    security-reviewer: "off"
+    debugger: "off"
+advisor:
+  enabled: false              # no automatic advisor traffic
+  reviewMode: agent-end
+  syncBacklog: "off"
+  immuneTurns: 5
+autolearn:
+  enabled: false
+  autoContinue: false
+edit:
+  mode: hashline
+  enforceSeenLines: true
+  fuzzyMatch: true
+  autoRepair:
+    enabled: true
+read:
+  defaultLimit: 180           # matches MAX_READ_LINES in src/read-budget.ts
+lsp:
+  diagnosticsOnEdit: true
+bashInterceptor:
+  enabled: true
+model:
+  loopGuard:
+    enabled: true
+  toolCallLoopGuard:
+    threshold: 5
+compaction:
+  enabled: true
+  midTurnEnabled: false        # AGENTS.md §4: no mid-turn compaction; preserves prompt cache
+  thresholdPercent: 80         # 200K window -> maintain context at 160K
+  asyncEnabled: true
+  idleEnabled: false           # no idle compaction either
+  idleThresholdTokens: 160000
+  supersedeReads: true
+  dropUseless: true
+  handoffSaveToDisk: true
+provider:
+  appendOnlyContext: "on"
+providers:
+  cacheRetention: long
+  cacheWarming: idle

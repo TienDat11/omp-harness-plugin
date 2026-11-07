@@ -1,0 +1,14 @@
+.omp/
+.ua/
+probes/
+tests/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.jsonl
+*.bak
+*.log
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/

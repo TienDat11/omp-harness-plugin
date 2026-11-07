@@ -1,0 +1,3 @@
+[submodule "vendor/zero-mem"]
+	path = vendor/zero-mem
+	url = https://github.com/Zero-Mem/Zero-mem.git
