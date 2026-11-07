@@ -29,25 +29,50 @@ const CATEGORY_KEYWORDS: Record<string, string[]> = {
   "architecture-docs": ["architecture", "design doc", "adr", "rfc", "refactor", "module boundary", "readme", "documentation"],
 };
 
+/**
+ * Strip system-envelope wrappers so routing scores only the user prose.
+ * Captures explicit `/skill:<name>` / `skill://<name>` invocations.
+ */
+export function extractUserPrompt(rawPrompt: string): { cleanPrompt: string; explicitSkills: string[] } {
+  let text = rawPrompt ?? "";
+  const explicitSkills: string[] = [];
+  for (const match of text.matchAll(/(?:\/skill:|skill:\/\/)([A-Za-z0-9][A-Za-z0-9._-]*)/g)) {
+    explicitSkills.push(match[1]);
+  }
+  for (const tag of ["system-reminder", "critical", "zero-mem-recall", "parent-read-ledger", "superagent-watchdog"]) {
+    const block = new RegExp(`<${tag}>[\\s\\S]*?<\\/${tag}>`, "gi");
+    text = text.replace(block, "\n");
+  }
+  text = text.replace(/^\[IMPORTANT: User invoked the "[^"]+" skill[^\n]*\n/gm, "");
+  return {
+    cleanPrompt: text.replace(/\n{3,}/g, "\n\n").trim(),
+    explicitSkills: [...new Set(explicitSkills)],
+  };
+}
+
 export function classifyTaskCategory(prompt: string): TaskCategory {
-  const p = (prompt ?? "").toLowerCase();
-  let best: { cat: TaskCategory; score: number; order: number } | null = null;
-  for (let i = 0; i < CATEGORY_ORDER.length; i++) {
-    const cat = CATEGORY_ORDER[i];
+  const p = extractUserPrompt(prompt ?? "").cleanPrompt.toLowerCase();
+  const scores = new Map<TaskCategory, number>();
+  let maxScore = 0;
+  for (const cat of CATEGORY_ORDER) {
     const kws = CATEGORY_KEYWORDS[cat] ?? [];
     const seen = new Set<string>();
     let score = 0;
     for (const kw of kws) {
       const k = kw.toLowerCase();
       if (seen.has(k)) continue;
-      if (p.includes(k)) { seen.add(k); score += 1; }
+      seen.add(k);
+      const escaped = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp("\\b(?:" + escaped + ")\\b").test(p)) score += 1;
     }
-    if (best === null || score > best.score) {
-      best = { cat, score, order: i };
-    }
+    scores.set(cat, score);
+    if (score > maxScore) maxScore = score;
   }
-  if (!best || best.score === 0) return "general";
-  return best.cat;
+  if (maxScore === 0) return "general";
+  const winners = CATEGORY_ORDER.filter((cat) => scores.get(cat) === maxScore);
+  if (winners.length === 1) return winners[0];
+  if (winners.includes("frontend-ui")) return "frontend-ui";
+  return "general";
 }
 
 export function isHoldoutTurn(sessionId: string, turnIndex: number): boolean {
@@ -339,15 +364,13 @@ export function scoreSkillDocs(
   prompt: string,
   opts?: { stackSkills?: string[]; suggestionSkills?: string[]; lift?: Record<string, number> },
 ): Candidate[] {
-  const p = (prompt ?? "").toLowerCase();
+  const { cleanPrompt, explicitSkills } = extractUserPrompt(prompt ?? "");
+  const p = cleanPrompt.toLowerCase();
+  const explicit = new Set(explicitSkills);
   const promptWords = tokenizeWords(p);
   const stack = new Set(opts?.stackSkills ?? []);
   const suggest = new Set(opts?.suggestionSkills ?? []);
   const lift = opts?.lift ?? {};
-
-  // Inverse document frequency over the installed catalog. A word every skill
-  // description mentions ("security", "code", "test") barely discriminates; a
-  // word two skills mention ("rls", "terraform") is a strong signal.
   const docCount = docs?.length ?? 0;
   const df = new Map<string, number>();
   for (const doc of docs ?? []) {
@@ -359,28 +382,20 @@ export function scoreSkillDocs(
       df.set(key, (df.get(key) ?? 0) + 1);
     }
   }
-  // Document frequency is keyed by stem so that a request saying "policy"
-  // still matches a catalog entry written as "policies".
   const idf = (word: string): number => Math.log(1 + docCount / (1 + (df.get(stem(word)) ?? 1)));
-
-  // Score = IDF-weighted sum of the request terms this skill's vocabulary
-  // explains, squashed into 0..1. Coverage (covered ÷ total) was tried and
-  // dropped: it punishes the right skill for request words it legitimately does
-  // not own ("build", "image" in a docker request), so a strong match scored
-  // 0.53. A sum needs no denominator and is dominated by distinctive hits,
-  // because a term every description mentions carries almost no weight.
   const requestTerms = [...promptWords]
     .filter((word) => STOPWORDS[word] !== true)
     .filter((word) => df.has(stem(word)))
     .map((word) => ({ word, weight: idf(word) }));
-
-  const raw: Array<{ doc: SkillDoc; rawScore: number; hitKws: string[]; stackBonus: boolean; suggestBonus: boolean; liftVal: number }> = [];
-
+  // Engage only past ~16 matched terms: ordinary prompts keep the calibrated
+  // curve untouched (THETA/pointer floors stay reachable); oversized prompts,
+  // which inflate rawScore for every generic skill, get damped. Step 2a envelope
+  // stripping is the primary defense against saturated scores; this is the
+  // residual guard for genuinely abnormal user text.
+  const lengthDamp = Math.max(1, Math.log2(Math.max(1, requestTerms.length) / 8));
+  const raw: Array<{ doc: SkillDoc; rawScore: number; hitKws: string[]; stackBonus: boolean; suggestBonus: boolean; liftVal: number; explicitBoost: boolean }> = [];
   for (const doc of docs ?? []) {
     if (isSkillVetoed(doc, p)) continue;
-
-    // A term the skill's own name carries is a direct self-description and
-    // counts double against an incidental mention in the prose.
     const nameWords = new Set((doc.name.toLowerCase().match(/[a-z][a-z0-9]*/g) ?? []).map(stem));
     const docStems = new Set<string>();
     for (const kw of doc.keywords ?? []) {
@@ -397,17 +412,16 @@ export function scoreSkillDocs(
     const stackBonus = stack.has(doc.name);
     const suggestBonus = suggest.has(doc.name);
     const liftVal = lift[doc.name] ?? 0;
-    raw.push({ doc, rawScore: kwScore, hitKws, stackBonus, suggestBonus, liftVal });
+    raw.push({ doc, rawScore: kwScore, hitKws, stackBonus, suggestBonus, liftVal, explicitBoost: explicit.has(doc.name) });
   }
-
   raw.sort((a, b) => {
     if (b.rawScore !== a.rawScore) return b.rawScore - a.rawScore;
     return a.doc.name.localeCompare(b.doc.name);
   });
-
   const normalized = raw.map((r) => {
-    const curved = 1 - Math.exp(-r.rawScore / SCORE_DECAY);
+    const curved = 1 - Math.exp(-r.rawScore / (SCORE_DECAY * lengthDamp));
     let score = curved;
+    if (r.explicitBoost) score += 0.25;
     if (r.stackBonus) score += 0.05;
     if (r.suggestBonus) score += 0.08;
     const liftClamped = Math.max(-0.10, Math.min(0.10, r.liftVal));
@@ -415,13 +429,16 @@ export function scoreSkillDocs(
     score = Math.max(0, Math.min(1, score));
     return { r, score };
   });
-  // Re-sort by FINAL score (after bonuses/curve/lift) so margin is measured against
-  // the true runner-up, not the pre-bonus rawScore ordering.
   normalized.sort((a, b) => {
     if (b.score !== a.score) return b.score - a.score;
     return a.r.doc.name.localeCompare(b.r.doc.name);
   });
-
+  if (explicit.size > 0) {
+    const boosted = normalized.filter((n) => n.r.explicitBoost);
+    const rest = normalized.filter((n) => !n.r.explicitBoost);
+    normalized.length = 0;
+    normalized.push(...boosted, ...rest);
+  }
   const result: Candidate[] = [];
   for (let i = 0; i < normalized.length; i++) {
     const { r, score } = normalized[i];
@@ -433,6 +450,7 @@ export function scoreSkillDocs(
     } else {
       segments.push(`kw:(+0.0)`);
     }
+    if (r.explicitBoost) segments.push("explicit(+0.25)");
     if (r.stackBonus) segments.push("stack(+0.05)");
     if (r.suggestBonus) segments.push("suggest(+0.08)");
     if (r.liftVal !== 0) segments.push(`lift(${r.liftVal >= 0 ? "+" : ""}${r.liftVal.toFixed(2)})`);
@@ -451,9 +469,25 @@ export function parseSkillDoc(markdown: string, fallbackName: string): SkillDoc 
   if (fmMatch) {
     const fm = fmMatch[1];
     const nameM = fm.match(/^name:\s*(.+)$/m);
+    const descBlockM = fm.match(/^description:\s*([>|][-+]?)\s*$/m);
     const descM = fm.match(/^description:\s*(.+)$/m);
     if (nameM) name = nameM[1].trim().replace(/^["']|["']$/g, "");
-    if (descM) description = descM[1].trim().replace(/^["']|["']$/g, "");
+    if (descBlockM) {
+      const blockLines: string[] = [];
+      const fmLines = fm.split(/\n/);
+      let inBlock = false;
+      for (const line of fmLines) {
+        if (/^description:\s*([>|][-+]?)\s*$/.test(line)) { inBlock = true; continue; }
+        if (!inBlock) continue;
+        if (/^(?:[A-Za-z0-9_-]+:|\s*---\s*$)/.test(line)) break;
+        const indented = line.match(/^\s{2,}(.+)$/);
+        if (!indented) { if (line.trim() === "") { blockLines.push(""); continue; } break; }
+        blockLines.push(indented[1]);
+      }
+      description = blockLines.join(descBlockM[1] === ">" ? " " : "\n").trim();
+    } else if (descM) {
+      description = descM[1].trim().replace(/^["']|["']$/g, "");
+    }
   } else {
     const headingM = md.match(/^#\s+(.+)$/m);
     if (headingM) name = headingM[1].trim();
@@ -626,6 +660,10 @@ export function decideValve(
     return { valveOpen: false, mode: "pointer_only", skill: null, pointer: "", reason: "no-candidate" };
   }
 
+  if (injected.has(candidates[0].name)) {
+    const name = candidates[0].name;
+    return { valveOpen: false, mode: "pointer_only", skill: name, pointer: `skill://${name}`, reason: "already-injected" };
+  }
   let selected: Candidate | null = null;
   for (const c of candidates) {
     if (!injected.has(c.name)) { selected = c; break; }
@@ -636,11 +674,13 @@ export function decideValve(
   }
   const top = selected;
   const topName = top.name;
-
   if (top.score < AUTOLOAD_THETA) {
     return { valveOpen: false, mode: "pointer_only", skill: topName, pointer: `skill://${topName}`, reason: "below-theta" };
   }
   if (top.score < AUTOLOAD_HIGH_CONFIDENCE && top.margin < AUTOLOAD_MARGIN) {
+    return { valveOpen: false, mode: "pointer_only", skill: topName, pointer: `skill://${topName}`, reason: "thin-margin" };
+  }
+  if (top.score >= AUTOLOAD_HIGH_CONFIDENCE && top.margin < 0.03) {
     return { valveOpen: false, mode: "pointer_only", skill: topName, pointer: `skill://${topName}`, reason: "thin-margin" };
   }
   const entry = allowlist[topName];

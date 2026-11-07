@@ -105,10 +105,10 @@ test("decideValve branches", () => {
   assert.equal(d.reason, "autoload");
   assert.equal(d.valveOpen, true);
   assert.equal(d.mode, "l1_autoload");
-  // High confidence (>= 0.85) bypasses the margin guard even with a thin margin.
+  // Step 2e: high confidence no longer bypasses the margin guard; saturated ties never open.
   d = decideValve([cand("s", 0.95, 0.02)], { allowlist: { s: { l1Digest: "d".repeat(10) } }, actualSha256: { s: "sha" }, pinnedSha256: { s: "sha" }, holdout: false, alreadyInjected: [] });
-  assert.equal(d.reason, "autoload");
-  assert.equal(d.valveOpen, true);
+  assert.equal(d.reason, "thin-margin");
+  assert.equal(d.valveOpen, false);
 });
 
 test("digestSkillDoc length and empty bullets and name", () => {

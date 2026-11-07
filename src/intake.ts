@@ -77,10 +77,11 @@ export function skillCandidates(systemPrompt: string, request: string, limit = M
   const techRe = /\b(harness|refactor|subagent|superagent|typescript|karpathy|lauren\s+tan|egm)\b/i;
   const nonTechRe = /\b(ask\s+matt|matt|business\s+flow|business-flow|quy\s+trinh|nghiep\s+vu|qt)\b/i;
   const isTechnicalPrompt = techRe.test(request) && !nonTechRe.test(request);
-  const notForRe = /\bnot\s+for\b/i;
+  const notForRe = /not\s+for\s+(.+?)(?:[.;]|$)/i;
   for (const skill of catalog) {
     // Skip skills whose description carries a "not for" exclusion.
-    if (notForRe.test(skill.description ?? "")) continue;
+    const notForMatch = (skill.description ?? "").match(notForRe);
+    if (notForMatch && request.toLowerCase().includes(notForMatch[1].trim().toLowerCase())) continue;
     // Skip ask-matt / business-flow on technical prompts (false positives).
     if ((skill.name === "ask-matt" || skill.name === "business-flow") && isTechnicalPrompt) continue;
     const skillTokens = tokenize(`${skill.name} ${skill.description}`);
@@ -158,6 +159,7 @@ export default function intake(pi: ExtensionAPI, deps: JudgeDeps = {}) {
     const rawText = String(event?.text ?? "");
     if (rawText.length === 0) return;
     const skills = skillCandidates(toSystemPrompt(ctx.getSystemPrompt()), rawText, MAX_SKILL_CANDIDATES);
+    if (skills.length === 0) setSuggestion(null);
     if (skills.length > 0) {
       setSuggestion({
         status: "skipped",

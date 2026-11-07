@@ -236,10 +236,12 @@ test("input handler classifies only the first submission in a task", async () =>
   await fireInput(pi, event);
   const afterFirst = JSON.stringify(getSuggestion());
   assert.notEqual(afterFirst, "null", "the first submission stores a shadow suggestion");
+  assert.equal(typeof JSON.parse(afterFirst), "object", "first submission stores a suggestion object");
 
   await fireInput(pi, event);
   assert.equal(submissionCount(), 2);
-  assert.equal(JSON.stringify(getSuggestion()), afterFirst, "the second submission must not replace it");
+  assert.equal(getSuggestion(), null, "second submission clears the stale suggestion when no skills match (Step 3)");
+
 });
 
 // ---------------------------------------------------------------------------

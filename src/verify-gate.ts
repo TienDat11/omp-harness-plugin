@@ -236,7 +236,6 @@ export default function verifyGate(pi: ExtensionAPI, deps: GateDeps = {}): void 
       }
       state.prompts += 1;
       const hadError = state.lastCheckError === true;
-      recordVerification(state);
       logHarnessCode(String(ctx?.cwd ?? "."), `G1 rc=40 tl=stop n=${state.mutations}`);
       const reasonPrefix = hadError
         ? `harness verify-gate: the last verification command FAILED and ${state.mutations} file mutation(s) remain unverified.`

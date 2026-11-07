@@ -195,6 +195,7 @@ export function appendBoundedLog(filePath: string, entry: string): void {
 
 /** Inject per-repo `p=` tag after the 2-char event code and write the line to the global harness log. */
 export function logHarnessCode(cwd: string, line: string): void {
+  if (!process.env.OMP_HARNESS_LOG_PATH && (process.env.OMP_HARNESS_TEST === "1" || process.execArgv.some((a) => a.includes("--test")) || process.env.NODE_TEST_CONTEXT !== undefined || (process.argv[1] ?? "").match(/(test|verify|run-probes)\.(mjs|js)$/i))) return;
   try {
     const formatted = /\bp=/.test(line) ? line : line.replace(/^([A-Z]\d) /, `$1 p=${repoSlug(cwd)} `);
     appendBoundedLog(globalHarnessLogPath(), `${formatted}\n`);
@@ -245,7 +246,7 @@ export function summarizeHarnessLog(text: string): string {
       if (fields.v === "1") verify1 += 1;
     }
     if (code === "S1" || code === "W1" || code === "W2" || code === "E1" || code === "G1") {
-      const k = fields.k ?? fields.rc ?? fields.ec ?? fields.s ?? fields.st ?? "";
+      const k = fields.skill ?? fields.k ?? fields.rc ?? fields.ec ?? fields.s ?? fields.st ?? "";
       if (k !== "") {
         if (!byKey[code]) byKey[code] = {};
         byKey[code][String(k)] = (byKey[code][String(k)] ?? 0) + 1;

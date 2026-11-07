@@ -607,6 +607,7 @@ export default function policy(pi: ExtensionAPI): void {
       }
     }
     const rewrittenInput = todoInput ?? taskInput ?? readInput;
+    if (rewrittenInput && typeof event.input === "object" && event.input !== null) Object.assign(event.input, rewrittenInput);
     const effectiveInput = rewrittenInput ?? event.input;
     if (typeof event.toolCallId === "string" && event.toolCallId !== "") {
       if (effectiveInputs.size >= 1024) {

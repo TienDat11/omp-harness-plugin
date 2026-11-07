@@ -33,27 +33,30 @@ export class SkillTelemetryStore {
       run.skillName, run.skillSha256, run.taskCategory, run.modelId, run.recordedAt,
     );
 
-    const row = this.db.prepare(`SELECT treatment_runs,treatment_reward_sum,control_runs,control_reward_sum FROM skill_stats WHERE skill_name=? AND skill_sha256=? AND task_category=? AND model_id=?`).get(
+    const row = this.db.prepare(`SELECT treatment_runs,treatment_reward_sum,control_runs,control_reward_sum,alpha,beta FROM skill_stats WHERE skill_name=? AND skill_sha256=? AND task_category=? AND model_id=?`).get(
       run.skillName, run.skillSha256, run.taskCategory, run.modelId,
-    ) as { treatment_runs: number; treatment_reward_sum: number; control_runs: number; control_reward_sum: number };
+    ) as { treatment_runs: number; treatment_reward_sum: number; control_runs: number; control_reward_sum: number; alpha: number; beta: number };
 
     let tRuns = row.treatment_runs;
     let tSum = row.treatment_reward_sum;
     let cRuns = row.control_runs;
     let cSum = row.control_reward_sum;
+    let alpha = row.alpha;
+    let beta = row.beta;
     const r = run.reward ?? 0;
     if (run.holdout) {
       cRuns += 1;
       cSum += r;
+      beta += 1;
     } else {
       tRuns += 1;
       tSum += r;
+      alpha += r;
+      beta += (1 - r);
     }
     const tMean = tRuns > 0 ? tSum / tRuns : 0;
     const cMean = cRuns > 0 ? cSum / cRuns : 0;
     const lift = tMean - cMean;
-    const alpha = 2 + tRuns;
-    const beta = 2 + cRuns;
     this.db.prepare(`UPDATE skill_stats SET treatment_runs=?,treatment_reward_sum=?,control_runs=?,control_reward_sum=?,alpha=?,beta=?,lift=?,last_used_at=? WHERE skill_name=? AND skill_sha256=? AND task_category=? AND model_id=?`).run(
       tRuns, tSum, cRuns, cSum, alpha, beta, lift, run.recordedAt,
       run.skillName, run.skillSha256, run.taskCategory, run.modelId,
@@ -61,12 +64,27 @@ export class SkillTelemetryStore {
   }
 
   recordManualRating(skillName: string, skillSha256: string, rating01: number): void {
-    this.db.prepare(`UPDATE skill_runs SET manual_rating = ? WHERE run_id = (SELECT run_id FROM skill_runs WHERE skill_name=? AND skill_sha256=? ORDER BY recorded_at DESC, run_id DESC LIMIT 1)`).run(
-      rating01, skillName, skillSha256,
+    const run = this.db.prepare(`SELECT run_id,holdout,reward,task_category,model_id FROM skill_runs WHERE skill_name=? AND skill_sha256=? ORDER BY recorded_at DESC, run_id DESC LIMIT 1`).get(skillName, skillSha256) as { run_id: string; holdout: number; reward: number | null; task_category: string; model_id: string } | undefined;
+    const delta = run ? rating01 - (run.reward ?? 0) : 0;
+    this.db.prepare(`UPDATE skill_runs SET manual_rating = ?, reward = ? WHERE run_id = (SELECT run_id FROM skill_runs WHERE skill_name=? AND skill_sha256=? ORDER BY recorded_at DESC, run_id DESC LIMIT 1)`).run(
+      rating01, rating01, skillName, skillSha256,
     );
     this.db.prepare(`UPDATE skill_stats SET manual_overrides = manual_overrides + 1 WHERE skill_name=? AND skill_sha256=?`).run(
       skillName, skillSha256,
     );
+    if (run && delta !== 0) {
+      if (run.holdout) {
+        this.db.prepare(`UPDATE skill_stats SET control_reward_sum = control_reward_sum + ? WHERE skill_name=? AND skill_sha256=? AND task_category=? AND model_id=?`).run(delta, skillName, skillSha256, run.task_category, run.model_id);
+      } else {
+        this.db.prepare(`UPDATE skill_stats SET treatment_reward_sum = treatment_reward_sum + ?, alpha = alpha + ?, beta = beta - ? WHERE skill_name=? AND skill_sha256=? AND task_category=? AND model_id=?`).run(delta, delta, delta, skillName, skillSha256, run.task_category, run.model_id);
+      }
+      const stats = this.db.prepare(`SELECT treatment_runs,treatment_reward_sum,control_runs,control_reward_sum FROM skill_stats WHERE skill_name=? AND skill_sha256=?`).all(skillName, skillSha256) as Array<{ treatment_runs: number; treatment_reward_sum: number; control_runs: number; control_reward_sum: number }>;
+      let tRuns = 0, tSum = 0, cRuns = 0, cSum = 0;
+      for (const s of stats) { tRuns += s.treatment_runs; tSum += s.treatment_reward_sum; cRuns += s.control_runs; cSum += s.control_reward_sum; }
+      const tMean = tRuns > 0 ? tSum / tRuns : 0;
+      const cMean = cRuns > 0 ? cSum / cRuns : 0;
+      this.db.prepare(`UPDATE skill_stats SET lift = ? WHERE skill_name=? AND skill_sha256=?`).run(tMean - cMean, skillName, skillSha256);
+    }
   }
 
   queryLift(skillName: string, skillSha256: string, taskCategory: string, modelId: string): { shadowMode: boolean; totalRuns: number; lift: number; posteriorMean: number } {

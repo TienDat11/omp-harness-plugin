@@ -26,6 +26,7 @@ const CHECK_IDS = [
   "no-credentials",
   "decisions-separation",
   "agent-guidelines",
+  "log-test-isolation",
 ];
 
 function toPosix(p) {
@@ -609,6 +610,30 @@ function checkAgentGuidelines() {
   return { id: "agent-guidelines", ok: true, detail: detail };
 }
 
+function checkLogTestIsolation() {
+  const problems = [];
+  const stateContent = exists(fullFromRel("src/state.ts")) ? readText(fullFromRel("src/state.ts")) : "";
+  if (!/OMP_HARNESS_TEST/.test(stateContent)) {
+    problems.push("state.ts missing OMP_HARNESS_TEST guard");
+  }
+  const text = exists(fullFromRel("src/stack-router.ts")) ? readText(fullFromRel("src/stack-router.ts")) : "";
+  const handlerStart = text.indexOf('pi.on("before_agent_start"');
+  if (handlerStart < 0) {
+    problems.push("stack-router.ts has no before_agent_start handler");
+  } else {
+    const body = text.slice(handlerStart);
+    const extractIdx = body.indexOf("extractUserPrompt");
+    const classifyIdx = body.indexOf("classifyTaskCategory");
+    if (extractIdx < 0 || classifyIdx < 0 || extractIdx > classifyIdx) {
+      problems.push("stack-router.ts calls classifyTaskCategory before extractUserPrompt");
+    }
+  }
+  if (problems.length > 0) {
+    return { id: "log-test-isolation", ok: false, detail: problems.join("; ") };
+  }
+  return { id: "log-test-isolation", ok: true, detail: "log test-isolation ok" };
+}
+
 function main() {
   let manifest;
   try {
@@ -640,6 +665,7 @@ function main() {
   results.push(checkNoCredentials());
   results.push(checkDecisionsSeparation());
   results.push(checkAgentGuidelines());
+  results.push(checkLogTestIsolation());
 
   const ordered = CHECK_IDS.map((id) => results.find((r) => r.id === id)).filter(Boolean);
 

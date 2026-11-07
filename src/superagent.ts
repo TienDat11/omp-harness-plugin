@@ -53,7 +53,7 @@ export interface Assignment {
   assignmentId: string;
   ticketId: string;
   agent: string;
-  status: "active" | "completed" | "degraded" | "failed" | "spawned";
+  status: "active" | "completed" | "degraded" | "dropped" | "failed" | "spawned";
   startedAt: number;
   completedAt?: number;
 }
@@ -370,7 +370,7 @@ export function recordWorkerReport(
           (x) => x.ticketId === report.ticketId && x.agent === report.agent && x.status === "active",
         );
         if (a) {
-          a.status = "completed";
+          a.status = "dropped";
           a.completedAt = now;
         }
       }
@@ -443,6 +443,9 @@ function stripPathNoise(path: string): string {
     .replace(/^`+|`+$/g, "")
     .replace(/^"|"$/g, "")
     .replace(/^'|'$/g, "")
+    .replace(/^(?:\*\*|__)/, "")
+    .replace(/(?:\*\*|__)$/, "")
+    .replace(/^[*_\s"'()\[\]<>,;.\`]+|[\s*_"'()\[\]<>,;.\`]+$/g, "")
     .replace(/^\[|]$/g, "")
     .replace(/#.*$/, "")
     .replace(/(?::\d+(?:-\d+)?)$/, "")
@@ -450,22 +453,16 @@ function stripPathNoise(path: string): string {
 }
 
 function looksLikePath(input: string): boolean {
-  return input.includes("/") || PATH_EXT_RE.test(input);
-}
-
-function collectStrings(input: Partial<SuperagentPacket>): string[] {
-  const out: string[] = [];
-  if (typeof input.target === "string") out.push(input.target);
-  if (typeof input.change === "string") out.push(input.change);
-  if (Array.isArray(input.acceptance)) {
-    for (const item of input.acceptance) if (typeof item === "string") out.push(item);
-  }
-  return out;
+  if (!input || /[(|?*<>\\]/.test(input)) return false;
+  if (/^[A-Za-z0-9_@.~-][A-Za-z0-9_./~-]*\.[A-Za-z0-9]{1,8}$/.test(input)) return true;
+  const dirPrefixes = ["src/", "test/", "tests/", "scripts/", "skills/", "agents/", "docs/", "config/", ".omp/"];
+  if (dirPrefixes.some((pre) => input.startsWith(pre))) return true;
+  return /^(?:[A-Za-z]:[\\/]|[\\/])/.test(input);
 }
 
 export function extractTargetPaths(input: string | Partial<SuperagentPacket>): string[] {
   const raw: string[] =
-    typeof input === "string" ? [input] : collectStrings(input);
+    typeof input === "string" ? [input] : (typeof input.target === "string" && input.target !== "" ? [input.target] : []);
   const seen = new Set<string>();
   const out: string[] = [];
   for (const item of raw) {
@@ -709,7 +706,12 @@ export function inspectSubagentResult(
   } else if (!SUPERAGENT_READY_RE.test(rawOutput) && PREMATURE_YIELD_RE.test(rawOutput)) {
     reason = "premature-yield";
     signal = PREMATURE_YIELD_RE.source;
-  } else if (SUPERAGENT_READY_RE.test(rawOutput) && !hasEvidenceToken(rawOutput)) {
+  } else if (
+    SUPERAGENT_READY_RE.test(rawOutput) &&
+    !hasEvidenceToken(rawOutput) &&
+    isMutatingTaskCall({ agent }) &&
+    !agent.startsWith("egm-")
+  ) {
     reason = "unevidenced-ready";
     signal = "[SUPERAGENT-REPORT: ready]";
   }
@@ -785,6 +787,7 @@ const ASSIGNMENT_STATUSES: ReadonlyArray<Assignment["status"]> = [
   "active",
   "completed",
   "degraded",
+  "dropped",
   "failed",
   "spawned",
 ];
@@ -920,14 +923,6 @@ export function resolveTaskGoal(
 const WORKER_REPORT_TAG_RE =
   /\[SUPERAGENT-REPORT:\s*(ready|blocked|failed|question|dropped|progress)\s*\]/gi;
 const INLINE_CODE_REPORT_RE = /`\[SUPERAGENT-REPORT:[^\]]*\]`/gi;
-const REPORT_SEVERITY: Readonly<Record<WorkerReportKind, number>> = {
-  failed: 6,
-  blocked: 5,
-  question: 4,
-  dropped: 3,
-  ready: 2,
-  progress: 1,
-};
 
 export function parseWorkerReportTag(rawOutput: string): WorkerReportKind | undefined {
   if (typeof rawOutput !== "string" || rawOutput === "") return undefined;
@@ -938,9 +933,7 @@ export function parseWorkerReportTag(rawOutput: string): WorkerReportKind | unde
   for (const match of sanitized.matchAll(WORKER_REPORT_TAG_RE)) {
     const kind = match[1]?.toLowerCase() as WorkerReportKind | undefined;
     if (!kind) continue;
-    if (chosen === undefined || REPORT_SEVERITY[kind] >= REPORT_SEVERITY[chosen]) {
-      chosen = kind;
-    }
+    chosen = kind;
   }
   return chosen;
 }

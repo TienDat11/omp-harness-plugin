@@ -472,7 +472,16 @@ test("extractTargetPaths extracts from a packet object", () => {
     change: "rename `src/b.ts`",
     acceptance: ["covers src/c.md"],
   });
-  assert.deepEqual(out.sort(), [nk("src/a.ts"), nk("src/b.ts"), nk("src/c.md")].sort());
+  // Step 5c: packet yields paths from input.target only, never from change/acceptance prose.
+  assert.deepEqual(out, [nk("src/a.ts")]);
+});
+
+test("extractTargetPaths rejects prose with no real path", () => {
+  assert.deepEqual(extractTargetPaths("try/catch block"), []);
+});
+
+test("extractTargetPaths rejects markdown-wrapped path in prose", () => {
+  assert.deepEqual(extractTargetPaths("**`src/read-budget.ts`**:"), []);
 });
 
 test("extractTargetPaths deduplicates", () => {

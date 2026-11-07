@@ -26,6 +26,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "./state.ts";
+import { extractUserPrompt } from "./skill-specs.ts";
 import { jevEnabled, judge, type JudgeDeps } from "./decisions.ts";
 import {
   ZeroMemBridge,
@@ -332,10 +333,11 @@ export default function memory(pi: ExtensionAPI, deps: MemoryDeps = {}) {
 
     if (request.length < MIN_REQUEST_CHARS) return undefined;
     if (!storeExists(cwd)) return undefined;
+    const cleanPrompt = extractUserPrompt(request).cleanPrompt;
 
     // Recall decision. Jev first when enabled; deterministic cue + code-entity
     // overlap when Jev is off or cannot answer.
-    const det = deterministicRecall(request, cwd, bridge);
+    const det = deterministicRecall(cleanPrompt, cwd, bridge);
     let shouldRecall = det.shouldRecall;
     let reason = det.reason;
     if (jevEnabled()) {
@@ -344,7 +346,7 @@ export default function memory(pi: ExtensionAPI, deps: MemoryDeps = {}) {
       const answer = await judge(
         {
           kind: "memory-recall",
-          state: { request: request.slice(0, 2_000), recent_units: sample },
+          state: { request: cleanPrompt.slice(0, 2_000), recent_units: sample },
           cwd,
         },
         deps,
@@ -374,7 +376,7 @@ export default function memory(pi: ExtensionAPI, deps: MemoryDeps = {}) {
         seenIds = new Set<string>();
         injectedBySession.set(sKey, seenIds);
       }
-      const result = await bridge.query(cwd, request, {
+      const result = await bridge.query(cwd, cleanPrompt, {
         topK: RECALL_TOP_K,
         excludeSession: sKey,
         excludeIds: seenIds,

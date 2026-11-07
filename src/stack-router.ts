@@ -23,6 +23,7 @@ import {
   classifyTaskCategory,
   decideValve,
   digestSkillDoc,
+  extractUserPrompt,
   foldVietnamese,
   isHoldoutTurn,
   parseSkillDoc,
@@ -32,7 +33,7 @@ import {
   type ValveDecision,
 } from "./skill-specs.ts";
 import { SkillTelemetryStore, computeReward, isHardRevert, type SkillRunRecord } from "./skill-telemetry.ts";
-import { classifyVerifyCommand } from "./verify-gate.ts";
+import { classifyVerifyCommand, isMutatingTaskCall } from "./verify-gate.ts";
 
 export interface StackInput {
   /** Raw package.json text, when present. */
@@ -238,22 +239,34 @@ export function installedSkillsDir(homeDir = os.homedir()): string {
 }
 
 export function installedSkillDirs(homeDir = os.homedir()): string[] {
-  const roots: string[] = [
-    path.join(homeDir, ".omp", "agent", "skills"),
-    path.join(homeDir, ".omp", "plugins", "node_modules", "@local", "omp-adaptive-harness", "skills"),
-  ];
-  const cachePluginsDir = path.join(homeDir, ".omp", "plugins", "cache", "plugins");
-  if (existsSync(cachePluginsDir)) {
-    for (const entry of [...readdirSync(cachePluginsDir)].sort()) {
-      roots.push(path.join(cachePluginsDir, entry, "skills"));
+  if (homeDir !== os.homedir()) {
+    const roots: string[] = [
+      path.join(homeDir, ".omp", "agent", "skills"),
+      path.join(homeDir, ".omp", "plugins", "node_modules", "@local", "omp-adaptive-harness", "skills"),
+    ];
+    const cachePluginsDir = path.join(homeDir, ".omp", "plugins", "cache", "plugins");
+    if (existsSync(cachePluginsDir)) {
+      for (const entry of [...readdirSync(cachePluginsDir)].sort()) {
+        roots.push(path.join(cachePluginsDir, entry, "skills"));
+      }
     }
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const root of roots) {
+      if (existsSync(root) && !seen.has(root)) {
+        seen.add(root);
+        out.push(root);
+      }
+    }
+    return out;
   }
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const root of roots) {
-    if (existsSync(root) && !seen.has(root)) {
-      seen.add(root);
-      out.push(root);
+  for (const entry of installedSkillEntries()) {
+    const dir = path.dirname(path.dirname(entry.file));
+    if (!seen.has(dir)) {
+      seen.add(dir);
+      out.push(dir);
     }
   }
   return out;
@@ -448,7 +461,7 @@ function pinSkills(cwd: string, corpus: SkillCorpus): void {
   let changed = false;
   for (const doc of corpus.docs) {
     const origin = corpus.origins[doc.name];
-    if (origin !== "user-global" && origin !== "bundle") continue;
+    if (origin !== "user-global" && origin !== "bundle" && origin !== "plugin-cache") continue;
     const sha = corpus.sha256[doc.name];
     if (!sha) continue;
     if (!allowlist[doc.name]) {
@@ -479,8 +492,9 @@ interface TurnState {
   acceptancePassRate: number | null;
 }
 
-export function installedSkillNames(skillsDir: string | string[] = installedSkillDirs()): Set<string> {
-  return new Set([...installedSkillFiles(skillsDir).keys()].sort());
+export function installedSkillNames(skillsDir?: string | string[]): Set<string> {
+  const entries = skillsDir === undefined ? installedSkillEntries() : installedSkillEntries(skillsDir);
+  return new Set(entries.map((entry) => entry.name).sort());
 }
 
 /**
@@ -670,14 +684,10 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
     // announcement and never advance the per-session turn counter.
     if (isSyntheticContinuationPrompt(prompt)) return undefined;
 
+    const key = `${cwd}::${sessionId}`;
+    const alreadyAnnounced = turnCounts.has(sessionId) || injectedSessions.has(key) || branchHasStackAnnouncement(ctx);
     const turnIndex = (turnCounts.get(sessionId) ?? 0) + 1;
     turnCounts.set(sessionId, turnIndex);
-
-    // A resumed session whose branch already has a harness-stack announcement
-    // never re-injects the turn-1 pointer message.
-    if (!turnCounts.has(sessionId) && branchHasStackAnnouncement(ctx)) {
-      turnCounts.set(sessionId, 1);
-    }
     let corpus: SkillCorpus | null = null;
     let candidates: Candidate[] = [];
     let decision: ValveDecision = {
@@ -687,7 +697,8 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
       pointer: "",
       reason: "no-candidate",
     };
-    const category = classifyTaskCategory(prompt);
+    const { cleanPrompt, explicitSkills } = extractUserPrompt(prompt);
+    const category = classifyTaskCategory(cleanPrompt);
     if (prompt.length >= 12) {
       try {
         corpus = corpusFor(cwd);
@@ -706,17 +717,17 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
           rawSuggested = s.skills;
         }
       }
-      const suggestionSkillsRaw = rawSuggested.filter((value): value is string => typeof value === "string");
+      const suggestionSkillsRaw = [...new Set([...rawSuggested.filter((value): value is string => typeof value === "string"), ...explicitSkills])];
       const suggestionSkills = suggestionSkillsRaw.filter((name) => {
         const doc = corpus.docs.find((d) => d.name === name);
-        return !doc || !skillNotForExcluded(doc, prompt);
+        return !doc || !skillNotForExcluded(doc, cleanPrompt);
       });
       const names = corpus.docs.map((doc) => doc.name);
       const modelId = process.env.PI_MODEL ?? process.env.OMP_MODEL ?? "*";
       const lift = liftFor(cwd, corpus, names, category, modelId);
       candidates = scoreSkillDocs(
-        selectCandidateDocs(corpus.docs, prompt, { stackSkills: fp?.skills ?? [], suggestionSkills }),
-        prompt,
+        selectCandidateDocs(corpus.docs, cleanPrompt, { stackSkills: fp?.skills ?? [], suggestionSkills }),
+        cleanPrompt,
         {
         stackSkills: fp?.skills ?? [],
         suggestionSkills,
@@ -738,12 +749,14 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
         pinnedSha256: pinned,
         holdout,
         alreadyInjected: [...seen],
+        recomputedDigests: corpus.digests,
+        actualRealpaths: corpus.realpaths,
       });
       // Rare open path: confirm against the whole catalog so the funnel cannot
       // hide a tied competitor; cost is one extra full scan only on a turn that
       // would already autoload, and the already-injected guard caps it per skill.
       if (decision.valveOpen) {
-        const fullCandidates = scoreSkillDocs(corpus.docs, prompt, {
+        const fullCandidates = scoreSkillDocs(corpus.docs, cleanPrompt, {
           stackSkills: fp?.skills ?? [],
           suggestionSkills,
           lift,
@@ -754,13 +767,24 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
           pinnedSha256: pinned,
           holdout,
           alreadyInjected: [...seen],
+          recomputedDigests: corpus.digests,
+          actualRealpaths: corpus.realpaths,
         });
+        candidates = fullCandidates;
       }
       if (decision.valveOpen && decision.skill) seen.add(decision.skill);
       for (const name of decision.secondarySkills?.map((s) => s.name) ?? []) seen.add(name);
       if (!decision.valveOpen && decision.mode === "holdout_control" && decision.skill) seen.add(decision.skill);
 
       const wantAutoload = decision.valveOpen && decision.skill !== null;
+      if (alreadyAnnounced && !wantAutoload) return undefined;
+      if (alreadyAnnounced && wantAutoload && decision.skill) {
+        const digest = corpus.digests[decision.skill] ?? "";
+        if (digest) {
+          return { message: { customType: "harness-stack", content: `\nAutoloaded (${decision.skill}):\n${digest}`, display: false } };
+        }
+        return undefined;
+      }
       if (wantAutoload && decision.skill) {
         logHarnessCode(
           cwd,
@@ -853,7 +877,6 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
 
     // No catalog or no candidate: keep the original stack-only message.
     if (!fp || fp.skills.length === 0) return undefined;
-    const key = `${cwd}::${sessionId}`;
     if (injectedSessions.has(key)) return undefined;
     injectedSessions.add(key);
     const detected = [...fp.languages, ...fp.frameworks, ...fp.tooling].join(", ");
@@ -868,7 +891,6 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if (ctx?.agent?.kind === "sub") return;
     const sessionId = ctx.sessionManager.getSessionId();
     const state = turns.get(sessionId);
     if (!state) return;
@@ -877,6 +899,11 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
     const toolName = event?.toolName;
     const input: unknown = event?.input;
     if (toolName === "write" || toolName === "edit" || toolName === "ast_edit") state.mutations += 1;
+    if ((toolName === "task" || toolName === "vibe_spawn") && isMutatingTaskCall(input)) state.mutations += 1;
+    if ((toolName === "task" || toolName === "vibe_spawn") && event && typeof event === "object" && "output" in event) {
+      const out = String((event as { output?: unknown }).output ?? "");
+      if (classifyVerifyCommand(out) || /# pass \d+/.test(out) || /# fail \d+/.test(out)) state.verifyRan = true;
+    }
     if (toolName === "bash" && input && typeof input === "object" && "command" in input && typeof input.command === "string") {
       const command = input.command;
       if (isHardRevert(command)) state.hardReverted = true;
@@ -935,7 +962,7 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
       skillName: state.skillName,
       skillSha256: state.skillSha256,
       taskCategory: state.taskCategory,
-      modelId: process.env.PI_MODEL ?? process.env.OMP_MODEL ?? "*",
+      modelId: (ctx as { model?: { id?: string } })?.model?.id ?? process.env.PI_MODEL ?? process.env.OMP_MODEL ?? "*",
       loadMode: state.loadMode,
       holdout: state.holdout,
       routerScore: state.routerScore,
