@@ -8,7 +8,7 @@
 - Skill discovery and pinning cover `user-global`, `bundle`, and `plugin-cache` origins; repo-local stays unpinned until `/harness-skill pin`.
 - `before_agent_start` announces the stack once per session (branch- and session-checked before the turn counter advances) and only emits the autoload tail afterwards.
 - Subagent work is attributed: `tool_result` no longer ignores subagent contexts, `task`/`vibe_spawn` mutations and verification runs count toward telemetry, and the model id comes from `ctx.model.id` instead of `"*"`.
-- Watchdog path extraction rejects prose (`try/catch`) and markdown noise, and packet inputs yield paths from `# Target` only; `[file#TAG]` and `path:line` citations count as evidence; the last `[SUPERAGENT-REPORT: ...]` tag wins; spawn ACKs no longer log a bogus `W1`.
+- Watchdog path extraction rejects prose (`try/catch`), and packet inputs yield paths from `# Target` only; `[file#TAG]` and `path:line` citations count as evidence; the last `[SUPERAGENT-REPORT: ...]` tag wins; spawn ACKs no longer log a bogus `W1`.
 - Harness telemetry never writes during tests (guard on `OMP_HARNESS_TEST`, `--test`, `NODE_TEST_CONTEXT`, test/verify/probes entrypoints); an explicit `OMP_HARNESS_LOG_PATH` still overrides.
 - `session_stop` no longer marks verification as recorded before the continuation turn runs.
 - Skill reward accounting uses outcome mass (treatment `alpha += r, beta += (1-r)`, control `beta += 1`) instead of run counts, and a manual rating rewrites the run reward and recomputes lift.

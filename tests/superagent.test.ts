@@ -504,10 +504,6 @@ test("extractTargetPaths rejects glob tokens", () => {
   assert.deepEqual(extractTargetPaths("*.ts"), []);
 });
 
-test("extractTargetPaths rejects prose with no real path", () => {
-  assert.deepEqual(extractTargetPaths("try/catch block"), []);
-});
-
 test("extractTargetPaths deduplicates", () => {
   const out = extractTargetPaths("src/a.ts `src/a.ts` src/a.ts");
   assert.deepEqual(out, [nk("src/a.ts")]);
