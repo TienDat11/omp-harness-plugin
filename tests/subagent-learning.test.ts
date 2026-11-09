@@ -1280,6 +1280,16 @@ const F12_CASES: Case[] = [
     return { ctx: fx.ctx, params: learningParams(fx, {}, { dir: other }) };
   } },
   { name: "destination dir missing (not created here)", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {}, { dir: join(fx.cwd, ".omp", "work", "missing") }) }) },
+  { name: "destination outcome.json is a directory (not a regular file)", make: (fx) => {
+    mkdirSync(join(fx.workDir, "outcome.json"));
+    return { ctx: fx.ctx, params: learningParams(fx) };
+  } },
+  { name: "destination outcome.json is a junction", make: (fx) => {
+    const target = join(fx.cwd, "jt");
+    mkdirSync(target);
+    symlinkSync(target, join(fx.workDir, "outcome.json"), "junction");
+    return { ctx: fx.ctx, params: learningParams(fx) };
+  } },
   { name: "destination through a junction component", make: (fx) => {
     const target = join(fx.cwd, "elsewhere");
     mkdirSync(target);
@@ -1293,6 +1303,7 @@ test("F12: path, symlink, evidence hash, session and proposal violations reject 
   for (const c of F12_CASES) {
     const fx = await harnessRecordFixture();
     const { ctx, params } = c.make(fx);
+    fx.before = fx.snapshot(); // after the case's own filesystem setup (e.g. an outcome.json directory)
     await assert.rejects(() => runHarnessRecord(ctx, params), (err: Error) => {
       assert.match(err.message, /^harness_record: subagentEvaluations rejected: /, `${c.name}: ${err.message}`);
       return true;
@@ -1364,6 +1375,54 @@ test("harness_record learning branch commits once, writes the projection, then t
   // Same operation, changed request (different lesson text) conflicts before any write.
   await assert.rejects(() => runHarnessRecord(fx.ctx, learningParams(fx, {}, { lesson: { ...lesson, why_this_design: "changed" } })), /conflict/);
   assert.deepEqual(fx.snapshot(), after);
+  closeSkillTelemetryStores();
+});
+
+test("harness_record: own post-commit flush failure reports committed + pending; another operation's pending projection reports NOT committed", async () => {
+  const fx = await harnessRecordFixture();
+  // Dispatch B before any projection is pending (a pending projection blocks learning dispatch).
+  const traceB = fx.store.prepareSubagentDispatch(dispatchInput({
+    sessionId: fx.sessionId, toolCallId: "t-b", inputHash: "hb",
+    envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d2")] },
+  })).trace;
+  // Test-only seam on the cached production store: every projection write fails.
+  const hooks = (fx.store as any).testHooks as TestHooks;
+  hooks.writeProjection = () => false;
+
+  // (b) Operation A commits, then its own flush fails.
+  const opA = evaluationOperationId(fx.sessionId, [fx.trace.dispatchId]);
+  const a = await runHarnessRecord(fx.ctx, learningParams(fx));
+  assert.equal(a.details.committed, true);
+  assert.equal(a.details.projection, "pending");
+  assert.equal(a.details.operationId, opA);
+  assert.equal(a.details.generation, 3, "A's own committed generation (dispatch B was generation 2)");
+  assert.match(a.content[0].text, /committed at generation 3 \(operation [0-9a-f]{64}\); outcome projection PENDING/);
+  assert.equal(fx.store.findEvaluationProjection(opA, fx.sessionId)!.status, "pending");
+  assert.equal(existsSync(join(fx.workDir, "outcome.json")), false);
+  assert.equal(storedTraceFor(fx.cwd, fx.trace.dispatchId).assessmentStatus, "applied");
+
+  // (a) Operation B: the store's pre-mutation drain fails on A, so B's transaction rolls back.
+  const before = fx.snapshot();
+  const traceBBefore = storedTraceFor(fx.cwd, traceB.dispatchId);
+  const b = await runHarnessRecord(fx.ctx, learningParams(fx, { dispatchId: traceB.dispatchId }));
+  const opB = evaluationOperationId(fx.sessionId, [traceB.dispatchId]);
+  assert.equal(b.details.committed, false);
+  assert.equal(b.details.rolledBack, true);
+  assert.equal(b.details.operationId, opB);
+  assert.equal(b.details.blockingOperationId, opA);
+  assert.equal("generation" in b.details, false, "no generation reported for a rolled-back request");
+  assert.match(b.content[0].text, /NOT committed \(rolled back\)/);
+  assert.doesNotMatch(b.content[0].text, /committed at generation/);
+  assert.ok(b.content[0].text.includes(opA));
+  assert.deepEqual(storedTraceFor(fx.cwd, traceB.dispatchId), traceBBefore, "B's trace untouched");
+  assert.deepEqual(fx.snapshot(), before, "no learning write for B");
+  assert.equal(fx.store.findEvaluationProjection(opB, fx.sessionId), null);
+
+  // Once writes work again, B commits and A's original bytes are flushed first.
+  delete hooks.writeProjection;
+  const b2 = await runHarnessRecord(fx.ctx, learningParams(fx, { dispatchId: traceB.dispatchId }));
+  assert.equal(b2.details.committed, true);
+  assert.equal(fx.store.findEvaluationProjection(opA, fx.sessionId)!.status, "flushed");
   closeSkillTelemetryStores();
 });
 

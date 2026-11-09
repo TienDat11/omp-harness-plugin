@@ -361,14 +361,22 @@ async function recordSubagentEvaluations(params: LearningParams, rawCtx: unknown
   try {
     result = store.commitSubagentEvaluationBatch({ operationId, sessionId, requestHash, destination, outcomeJson, assessments, now: Date.now() });
   } catch (err) {
-    const e = err as Error & { code?: string; generation?: number };
+    const e = err as Error & { code?: string; generation?: number; operationId?: string };
     if (e.code !== "PROJECTION_PENDING") throw err;
-    // Learning is committed; only the outcome.json projection is pending. Retrying the same request replays.
+    if (e.operationId !== operationId) {
+      // The store's pre-mutation drain hit another operation's pending projection: this transaction
+      // rolled back, so nothing of this request was committed. Never report its generation.
+      // A's raw message says "learning committed" about A; do not echo it into B's result.
+      const text = `${base}\nlearning: NOT committed (rolled back); the pending outcome projection of operation ${e.operationId} could not be flushed and blocks new learning. Resolve that write, then retry this request.`;
+      return { content: [{ type: "text" as const, text }], details: { file: destination, failed, operationId, committed: false, rolledBack: true, blockingOperationId: e.operationId, blockingGeneration: e.generation } };
+    }
+    // This operation's learning is committed (now, or by an earlier identical request); only its
+    // outcome.json projection is pending. Retrying the same request replays and drains.
     const text = `${base}\nlearning: committed at generation ${e.generation} (operation ${operationId}); outcome projection PENDING: ${e.message}`;
-    return { content: [{ type: "text" as const, text }], details: { file: destination, failed, operationId, generation: e.generation, replay: false, projection: "pending" } };
+    return { content: [{ type: "text" as const, text }], details: { file: destination, failed, operationId, committed: true, generation: e.generation, replay: prior !== null, projection: "pending" } };
   }
 
-  const details: Record<string, unknown> = { file: destination, failed, operationId, generation: result.generation, replay: result.replay, projection: result.status };
+  const details: Record<string, unknown> = { file: destination, failed, operationId, committed: true, generation: result.generation, replay: result.replay, projection: result.status };
   const learningLine = `learning: ${result.replay ? "replayed" : "applied"} operation ${operationId} at generation ${result.generation}`;
   let lessonText = "";
   const lesson = params.lesson;
