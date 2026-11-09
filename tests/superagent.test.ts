@@ -18,6 +18,7 @@ import {
   DEFAULT_MAX_SURGICAL_FILES,
   SUPERAGENT_CONTRACT_TAG,
   GOLDFISH_CONTRACT_TAG,
+  GOLDFISH_CONTRACT_BLOCK,
   resolveSuperagentTaskInput,
   extractToolResultOutput,
   resolveTaskAgentName,
@@ -31,9 +32,10 @@ import {
   loadSuperagentSnapshot,
   type SuperagentState,
 } from "../src/superagent.ts";
-import { normalizePathKey } from "../src/state.ts";
+import { normalizePathKey, rememberReadStat } from "../src/state.ts";
+import { resolveTaskInput as resolveReadBudgetTaskInput, PARENT_LEDGER_TAG } from "../src/read-budget.ts";
 import { fakePi, fakeCtx, tmpDir } from "./_fake-pi.ts";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import tools from "../src/tools.ts";
 import { sessionStateKey, subagentSessionKey } from "../src/skill-telemetry.ts";
@@ -1374,4 +1376,314 @@ test("legacy harness_record without subagentEvaluations is unchanged", async () 
     assert.equal(outcome.notes, "n");
   }
   assert.equal(existsSync(join(dir, ".omp", "harness", "skill-telemetry.db")), false, "legacy path opens no learning store");
+});
+
+// ── Task 11 (F10): dispatch envelope, selection and memory adapters ──
+
+const CANDIDATES_OPEN = "<subagent-candidates>";
+const MEMORY_OPEN = "<subagent-policy-memory>";
+const MEMORY_CLOSE = "</subagent-policy-memory>";
+const prefix = "# Goal\nShip the widget\n\n";
+const suffix = "\n\nTrailing instructions stay.";
+const selectedPrompt = "Selected prompt: edit src/widget.ts only";
+
+function envelopeTag(goalId = "goal-f10", prompts: string[] = [selectedPrompt]): string {
+  const candidates = prompts.map((p, i) => ({
+    parentId: null, directionId: `dir-${i}`, mechanism: `mechanism ${i}`, change: `change ${i}`, scope: ["src/widget.ts"], prompt: p,
+  }));
+  return `${CANDIDATES_OPEN}${JSON.stringify({ version: 1, goalId, candidates })}</subagent-candidates>`;
+}
+
+function taskInput(fields: Record<string, unknown>): Record<string, unknown> {
+  return { agent: "coder", ...fields };
+}
+
+function batchInput(items: Array<Record<string, unknown>>, shared: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...shared, tasks: items.map((it) => ({ agent: "coder", ...it })) };
+}
+
+const mem = { revision: "rev-1", text: `${MEMORY_OPEN}\nrevision:rev-1\n{"lessons":[],"cooldowns":[],"excludedCount":0}\n${MEMORY_CLOSE}` };
+const mem2 = { revision: "rev-2", text: `${MEMORY_OPEN}\nrevision:rev-2\n{"lessons":[],"cooldowns":["x"],"excludedCount":0}\n${MEMORY_CLOSE}` };
+
+function count(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+type HookResult = { input?: Record<string, unknown>; block?: boolean; reason?: string } | undefined;
+
+function learningHost(): { pi: ReturnType<typeof fakePi>; ctx: ReturnType<typeof fakeCtx>; dir: string } {
+  const dir = tmpDir();
+  const pi = fakePi();
+  mount(pi);
+  return { pi, ctx: fakeCtx(dir), dir };
+}
+
+async function dispatch(
+  host: { pi: ReturnType<typeof fakePi>; ctx: unknown },
+  toolName: string,
+  input: Record<string, unknown>,
+  toolCallId: string | undefined,
+): Promise<HookResult> {
+  const event: Record<string, unknown> = { toolName, input };
+  if (toolCallId !== undefined) event.toolCallId = toolCallId;
+  return (await fire(host.pi, "tool_call", event, host.ctx)) as HookResult;
+}
+
+function assertDispatched(text: string, prompt: string = selectedPrompt): void {
+  assert.ok(text.includes(prompt), `selected prompt missing: ${text}`);
+  assert.equal(text.includes(CANDIDATES_OPEN), false, "envelope must be replaced");
+  assert.equal(count(text, GOLDFISH_CONTRACT_BLOCK), 1, "static contract exactly once");
+  assert.equal(count(text, MEMORY_OPEN), 1, "own memory block exactly once");
+  assert.equal(count(text, MEMORY_CLOSE), 1);
+  assert.match(text, /<subagent-policy-memory>\nrevision:[0-9a-f]{64}\n\{"lessons":\[/);
+}
+
+test("F10: single task context receives selected prompt and memory, prefix kept", async () => {
+  const host = learningHost();
+  const r = await dispatch(host, "task", taskInput({ context: prefix + envelopeTag() + suffix }), "f10-ctx");
+  assert.ok(r?.input, JSON.stringify(r));
+  const out = String(r.input.context);
+  assertDispatched(out);
+  assert.ok(out.startsWith(prefix + selectedPrompt + suffix), out);
+  // The selection is persisted as a real trace in the production store.
+  assert.ok(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")));
+});
+
+test("F10: single task field precedence task, then assignment, then description", async () => {
+  const host = learningHost();
+  const viaTask = await dispatch(host, "task", taskInput({ task: prefix + envelopeTag(), assignment: "other", context: "shared" }), "p-task");
+  assertDispatched(String(viaTask!.input!.task));
+  assert.equal(viaTask!.input!.assignment, "other");
+  assert.equal(viaTask!.input!.context, "shared");
+  const viaAssignment = await dispatch(host, "task", taskInput({ task: "", assignment: prefix + envelopeTag() }), "p-assign");
+  assertDispatched(String(viaAssignment!.input!.assignment));
+  assert.ok(String(viaAssignment!.input!.assignment).startsWith(prefix));
+  const viaDescription = await dispatch(host, "task", taskInput({ description: envelopeTag() + suffix }), "p-desc");
+  assertDispatched(String(viaDescription!.input!.description));
+  assert.ok(String(viaDescription!.input!.description).includes(suffix));
+});
+
+test("F10: tasks[].task, assignment, description precedence", async () => {
+  const host = learningHost();
+  const input = batchInput(
+    [
+      { task: prefix + envelopeTag("goal-a", ["prompt for item zero"]) },
+      { task: "", assignment: envelopeTag("goal-b", ["prompt for item one"]) + suffix },
+      { description: envelopeTag("goal-c", ["prompt for item two"]) },
+    ],
+    { context: "shared instructions only" },
+  );
+  const r = await dispatch(host, "task", input, "batch-1");
+  assert.ok(r?.input, JSON.stringify(r));
+  const tasks = r.input.tasks as Array<Record<string, string>>;
+  assertDispatched(tasks[0].task, "prompt for item zero");
+  assert.ok(tasks[0].task.startsWith(prefix));
+  assertDispatched(tasks[1].assignment, "prompt for item one");
+  assert.ok(tasks[1].assignment.startsWith("prompt for item one" + suffix));
+  assertDispatched(tasks[2].description, "prompt for item two");
+  assert.equal(r.input.context, "shared instructions only", "shared context keeps instructions only");
+});
+
+test("F10: spawn.prompt and send.message receive selected prompt", async () => {
+  const host = learningHost();
+  const spawn = await dispatch(host, "vibe_spawn", { name: "w1", prompt: prefix + envelopeTag() + suffix }, "spawn-1");
+  const prompt = String(spawn!.input!.prompt);
+  assertDispatched(prompt);
+  assert.ok(prompt.startsWith(prefix + selectedPrompt + suffix), prompt);
+  const withContract = `${prefix}${envelopeTag()}\n\n${GOLDFISH_CONTRACT_BLOCK}`;
+  const spawn2 = await dispatch(host, "vibe_spawn", { name: "w2", prompt: withContract }, "spawn-2");
+  assertDispatched(String(spawn2!.input!.prompt));
+  const send = await dispatch(host, "vibe_send", { id: "w1", message: prefix + envelopeTag() + suffix }, "send-1");
+  const message = String(send!.input!.message);
+  assertDispatched(message);
+  assert.ok(message.startsWith(prefix + selectedPrompt + suffix), message);
+  // Legacy vibe_send without an envelope is untouched.
+  assert.equal(await dispatch(host, "vibe_send", { id: "w1", message: "plain" }, "send-2"), undefined);
+});
+
+test("F10: ambiguous envelope in shared context and item rejects batch", async () => {
+  const host = learningHost();
+  const ambiguous = batchInput([{ task: envelopeTag() }, { task: envelopeTag("goal-2") }], { context: envelopeTag("goal-3") });
+  const r = await dispatch(host, "task", ambiguous, "amb-1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /ambiguous/);
+  const missing = await dispatch(host, "task", batchInput([{ task: envelopeTag() }, { task: "no envelope here" }]), "amb-2");
+  assert.equal(missing?.block, true);
+  assert.match(String(missing?.reason), /tasks\[1\]/);
+  const singleBoth = await dispatch(host, "task", taskInput({ task: envelopeTag(), context: envelopeTag("goal-x") }), "amb-3");
+  assert.equal(singleBoth?.block, true);
+  assert.match(String(singleBoth?.reason), /ambiguous/);
+  // The legacy adapter keeps its input for the same batch.
+  const legacy = resolveSuperagentTaskInput(ambiguous);
+  assert.ok(legacy);
+  assert.ok(String(legacy.context).includes(GOLDFISH_CONTRACT_TAG));
+});
+
+test("F10: no-envelope legacy task with no supported string field keeps legacy behavior", async () => {
+  const plain = resolveSuperagentTaskInput(taskInput({ task: undefined, context: "plain" }), freshState(), undefined);
+  assert.ok(plain);
+  assert.equal(plain.context, `plain\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  assert.equal(resolveSuperagentTaskInput(taskInput({}), freshState(), undefined), undefined);
+  // Single-task fallback: no context, no tasks batch → task, then assignment, then description.
+  const single = resolveSuperagentTaskInput({ task: "", assignment: "do x" });
+  assert.equal(single?.assignment, `do x\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  assert.equal(single?.task, "");
+  // Disk/DB failure never touches the no-envelope legacy path.
+  const host = learningHost();
+  mkdirSync(join(host.dir, ".omp"), { recursive: true });
+  writeFileSync(join(host.dir, ".omp", "harness"), "not a directory");
+  const legacy = await dispatch(host, "task", taskInput({ context: "plain" }), "legacy-1");
+  assert.equal(String(legacy!.input!.context), `plain\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  const spawn = await dispatch(host, "vibe_spawn", { prompt: "edit src/a.ts" }, "legacy-2");
+  assert.ok(String(spawn!.input!.prompt).includes(GOLDFISH_CONTRACT_TAG));
+  // The learning branch fails closed on the same broken store.
+  const learning = await dispatch(host, "task", taskInput({ context: envelopeTag() }), "learn-1");
+  assert.equal(learning?.block, true);
+  assert.match(String(learning?.reason), /store unavailable/);
+});
+
+test("F10: legacy dispatch without envelope opens no learning store", async () => {
+  const host = learningHost();
+  await dispatch(host, "task", taskInput({ context: "plain" }), "l1");
+  await dispatch(host, "vibe_spawn", { prompt: "edit src/a.ts" }, "l2");
+  assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+});
+
+test("F10: missing session or call identity blocks learning, legacy continues; sub never learns", async () => {
+  const host = learningHost();
+  const noCall = await dispatch(host, "task", taskInput({ context: envelopeTag() }), undefined);
+  assert.equal(noCall?.block, true);
+  assert.match(String(noCall?.reason), /toolCallId/);
+  const noSession = { pi: host.pi, ctx: { cwd: host.dir } };
+  const r = await dispatch(noSession, "task", taskInput({ context: envelopeTag() }), "c1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /session/);
+  const legacy = await dispatch(noSession, "task", taskInput({ context: "plain" }), undefined);
+  assert.ok(String(legacy!.input!.context).includes(GOLDFISH_CONTRACT_TAG));
+  const sub = { pi: host.pi, ctx: { ...fakeCtx(host.dir), agent: { kind: "sub" } } };
+  assert.equal(await dispatch(sub, "task", taskInput({ context: envelopeTag() }), "c2"), undefined);
+  assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+});
+
+test("F10: malformed envelope fails learning, legacy path still returns input", async () => {
+  const host = learningHost();
+  const badJson = taskInput({ context: `${prefix}${CANDIDATES_OPEN}{not json</subagent-candidates>` });
+  const r = await dispatch(host, "task", badJson, "bad-1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /malformed candidate envelope/);
+  const legacy = resolveSuperagentTaskInput(badJson);
+  assert.ok(legacy);
+  assert.ok(String(legacy.context).startsWith(String(badJson.context)));
+  const unclosed = await dispatch(host, "task", taskInput({ context: `${CANDIDATES_OPEN}{}` }), "bad-2");
+  assert.equal(unclosed?.block, true);
+  const duplicate = await dispatch(host, "task", taskInput({ context: envelopeTag() + envelopeTag() }), "bad-3");
+  assert.equal(duplicate?.block, true);
+  const badVersion = await dispatch(host, "vibe_spawn", { prompt: envelopeTag().replace('"version":1', '"version":2') }, "bad-4");
+  assert.equal(badVersion?.block, true);
+  assert.match(String(badVersion?.reason), /version/);
+  const outside = await dispatch(host, "task", taskInput({ context: "plain", goal: envelopeTag() }), "bad-5");
+  assert.equal(outside?.block, true);
+  // The session keeps working after a failed learning branch.
+  const next = await dispatch(host, "task", taskInput({ context: envelopeTag() }), "ok-1");
+  assertDispatched(String(next!.input!.context));
+});
+
+test("F10: replayed tool call returns the same selection and byte-identical text", async () => {
+  const host = learningHost();
+  const input = taskInput({ context: prefix + envelopeTag("goal-r", ["alpha prompt", "beta prompt"]) });
+  const first = await dispatch(host, "task", input, "replay-1");
+  const second = await dispatch(host, "task", input, "replay-1");
+  assert.equal(String(second!.input!.context), String(first!.input!.context));
+  const out = String(first!.input!.context);
+  assert.equal(Number(out.includes("alpha prompt")) + Number(out.includes("beta prompt")), 1, "exactly one candidate selected");
+});
+
+test("F10: own memory block revision semantics and full-block detection", () => {
+  const base = taskInput({ task: `${prefix}${selectedPrompt}` });
+  const once = resolveSuperagentTaskInput(base, freshState(), mem)!;
+  const text = String(once.task);
+  assert.ok(text.startsWith(prefix + selectedPrompt));
+  assert.equal(count(text, GOLDFISH_CONTRACT_BLOCK), 1);
+  assert.equal(count(text, mem.text), 1);
+  // Same revision: byte-identical, no duplicate.
+  const again = resolveSuperagentTaskInput(once, freshState(), mem)!;
+  assert.equal(again.task, text);
+  // Different revision: only the own block is replaced.
+  const replaced = String(resolveSuperagentTaskInput(once, freshState(), mem2)!.task);
+  assert.equal(replaced, text.replace(mem.text, mem2.text));
+  // Opening tag without a closing tag is malformed, not "present".
+  assert.throws(() => resolveSuperagentTaskInput(taskInput({ task: `x ${MEMORY_OPEN} y` }), freshState(), mem), /malformed/);
+  assert.throws(() => resolveSuperagentTaskInput(taskInput({ task: `${mem.text}\n${mem.text}` }), freshState(), mem), /duplicate/);
+  assert.throws(
+    () => resolveSuperagentTaskInput(taskInput({ task: `x ${GOLDFISH_CONTRACT_TAG} unclosed` }), freshState(), mem),
+    /malformed/,
+  );
+  // A batch memory context targets its own item only.
+  const batch = resolveSuperagentTaskInput(
+    batchInput([{ task: "a" }, { assignment: "b" }]),
+    freshState(),
+    [{ ...mem, itemIndex: 1 }],
+  )!;
+  const items = batch.tasks as Array<Record<string, string>>;
+  assert.equal(items[0].task, "a");
+  assert.ok(items[1].assignment.startsWith("b\n\n"));
+  assert.equal(count(items[1].assignment, mem.text), 1);
+  // Legacy path (no memory context) keeps user text with stray own tags and still adds the contract.
+  const legacy = resolveSuperagentTaskInput({ context: `note ${MEMORY_OPEN}` });
+  assert.equal(legacy?.context, `note ${MEMORY_OPEN}\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+});
+
+function ledgerFixture(cwd: string): unknown[] {
+  writeFileSync(join(cwd, "file.ts"), "const a = 1;\n");
+  const st = statSync(join(cwd, "file.ts"));
+  rememberReadStat("ledger-read-1", st.mtimeMs, st.size);
+  return [
+    { type: "message", id: "e1", message: { role: "assistant", content: [{ type: "toolCall", id: "ledger-read-1", name: "read", arguments: { path: "file.ts" } }] } },
+    { type: "message", id: "e2", message: { role: "toolResult", toolCallId: "ledger-read-1", toolName: "read", content: [{ type: "text", text: "[file.ts#A1B2]\n1:const a = 1;\n" }] } },
+  ];
+}
+
+function blocksOf(text: string, open: string, close: string): string[] {
+  const out: string[] = [];
+  let at = text.indexOf(open);
+  while (at >= 0) {
+    const end = text.indexOf(close, at);
+    out.push(text.slice(at, end + close.length));
+    at = text.indexOf(open, end);
+  }
+  return out;
+}
+
+test("F10: two extension orders keep ledger block and memory block", async () => {
+  const host = learningHost();
+  const branch = ledgerFixture(host.dir);
+  const LEDGER_CLOSE = "</parent-read-ledger>";
+
+  // Single task: both adapters write into input.task.
+  const single = taskInput({ task: prefix + envelopeTag() });
+  const ledgerFirst = resolveReadBudgetTaskInput(single, branch, host.dir)!;
+  const ledgerBlock = blocksOf(String(ledgerFirst.task), PARENT_LEDGER_TAG, LEDGER_CLOSE);
+  assert.equal(ledgerBlock.length, 1);
+  const a = String((await dispatch(host, "task", ledgerFirst, "order-1"))!.input!.task);
+  const memoryFirst = (await dispatch(host, "task", single, "order-2"))!.input!;
+  const b = String(resolveReadBudgetTaskInput(memoryFirst, branch, host.dir)!.task);
+  for (const out of [a, b]) {
+    assertDispatched(out);
+    assert.deepEqual(blocksOf(out, PARENT_LEDGER_TAG, LEDGER_CLOSE), ledgerBlock);
+    assert.ok(out.startsWith(prefix + selectedPrompt));
+  }
+  assert.deepEqual(blocksOf(a, MEMORY_OPEN, MEMORY_CLOSE), blocksOf(b, MEMORY_OPEN, MEMORY_CLOSE));
+
+  // Batch: ledger owns shared context, memory owns the item text.
+  const batch = batchInput([{ task: envelopeTag("goal-b1") }, { task: envelopeTag("goal-b2") }], { context: "shared" });
+  const ledgerBatch = resolveReadBudgetTaskInput(batch, branch, host.dir)!;
+  const ledgerBatchBlock = blocksOf(String(ledgerBatch.context), PARENT_LEDGER_TAG, LEDGER_CLOSE);
+  assert.equal(ledgerBatchBlock.length, 1);
+  const c = (await dispatch(host, "task", ledgerBatch, "order-3"))!.input!;
+  const d = resolveReadBudgetTaskInput((await dispatch(host, "task", batch, "order-4"))!.input!, branch, host.dir)!;
+  for (const out of [c, d]) {
+    assert.deepEqual(blocksOf(String(out.context), PARENT_LEDGER_TAG, LEDGER_CLOSE), ledgerBatchBlock);
+    assert.equal(String(out.context).includes(MEMORY_OPEN), false, "no goal memory forced into shared context");
+    for (const item of out.tasks as Array<Record<string, string>>) assertDispatched(item.task);
+  }
 });
