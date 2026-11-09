@@ -177,7 +177,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
       const state = this.hydrateLearningState();
       const memory = this.dispatchMemorySnapshot(state);
       const getTrace = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`);
-      const results: DispatchResult[] = [];
+      const results: Array<DispatchResult | null> = valid.map(() => null);
       const fresh = new Set<number>();
       valid.forEach((input, i) => {
         const id = dispatchId(input.sessionId, input.toolCallId, input.itemIndex);
@@ -185,21 +185,25 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
         if (existing) {
           const trace = JSON.parse(existing.payload_json) as Trace;
           if (trace.inputHash !== input.inputHash) throw new Error("dispatch conflict");
-          const selected = trace.candidates.find((c) => c.directionArmId === trace.selectedDirectionArmId) ?? null;
-          results.push({ trace, selected, memoryText: trace.memoryText, reason: trace.selectedDirectionArmId === null ? "all_excluded" : "selected" });
-          return;
+          // A blocked (not_dispatched) trace must never hand back a candidate to dispatch.
+          const blocked = trace.selectedDirectionArmId === null || trace.assessmentStatus === "not_dispatched";
+          const selected = blocked ? null : trace.candidates.find((c) => c.directionArmId === trace.selectedDirectionArmId) ?? null;
+          results[i] = { trace, selected, memoryText: trace.memoryText, reason: selected ? "selected" : "all_excluded" };
+        } else {
+          fresh.add(i);
         }
-        results.push(this.selectSubagentDirection(state, input, memory));
-        fresh.add(i);
       });
-      if (fresh.size === 0) return results;
-      if (results.some((r, i) => fresh.has(i) && r.reason === "all_excluded")) {
+      if (fresh.size === 0) return results as DispatchResult[];
+      this.checkCandidateCollisions(valid.filter((_, i) => fresh.has(i)));
+      for (const i of fresh) results[i] = this.selectSubagentDirection(state, valid[i], memory);
+      const out = results as DispatchResult[];
+      if (out.some((r, i) => fresh.has(i) && r.reason === "all_excluded")) {
         // A blocked tool call dispatches nothing: keep every selection, mark unsent items not_dispatched.
-        results.forEach((r, i) => { if (fresh.has(i)) r.trace.assessmentStatus = "not_dispatched"; });
+        out.forEach((r, i) => { if (fresh.has(i)) r.trace.assessmentStatus = "not_dispatched"; });
       }
       const insert = this.db.prepare(`INSERT INTO dispatch_traces(dispatch_id, payload_json, created_at) VALUES (?,?,?)`);
       for (const i of fresh) {
-        const t = results[i].trace;
+        const t = out[i].trace;
         insert.run(t.dispatchId, JSON.stringify(t), t.createdAt);
       }
       const nextGeneration = row.generation + 1;
@@ -207,8 +211,28 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
       const res = this.db.prepare(`UPDATE learning_state SET generation=?, payload_json=? WHERE id=1 AND generation=?`)
         .run(nextGeneration, JSON.stringify(state), row.generation);
       if (Number(res.changes) !== 1) throw new Error("learning_state generation conflict");
-      return results;
+      return out;
     });
+  }
+
+  /** Same directionArmId must keep the same mechanism/change/scope across history and within the batch. */
+  private checkCandidateCollisions(inputs: DispatchInput[]): void {
+    const meta = (c: CandidateSpec): string => JSON.stringify([c.mechanism, c.change, normalizeScope(c.scope)]);
+    const known = new Map<string, string>();
+    const rows = this.db.prepare(`SELECT payload_json FROM dispatch_traces`).all() as Array<{ payload_json: string }>;
+    for (const r of rows) {
+      const t = JSON.parse(r.payload_json) as Trace;
+      for (const c of t.candidates) if (!known.has(c.directionArmId)) known.set(c.directionArmId, meta(c));
+    }
+    for (const input of inputs) {
+      for (const c of input.envelope.candidates) {
+        const arm = directionArmId(input.envelope.goalId, c.parentId, c.directionId);
+        const m = meta(c);
+        const prior = known.get(arm);
+        if (prior === undefined) known.set(arm, m);
+        else if (prior !== m) fail(`directionId ${c.directionId}`, "metadata (mechanism/change/scope) differs from an earlier proposal with the same direction; use a new directionId");
+      }
+    }
   }
 
   recordRun(run: SkillRunRecord): void {

@@ -380,3 +380,55 @@ test("counter overflow rejects and rolls back", () => {
   assert.equal(store.prepareSubagentDispatch(dispatchInput({})).reason, "selected");
   store.close();
 });
+
+function envWith(over: Record<string, unknown>) {
+  return { version: 1 as const, goalId: "g1", candidates: [{ ...spec(null, "d1"), ...over }] };
+}
+
+test("collision: same directionId with changed change text is rejected before any mutation", () => {
+  const store = openStore();
+  store.prepareSubagentDispatch(dispatchInput({}));
+  const before = learningState(store);
+  assert.throws(
+    () => store.prepareSubagentDispatch(dispatchInput({ toolCallId: "t2", inputHash: "h2", envelope: envWith({ change: "different" }) })),
+    /directionId d1/,
+  );
+  assert.deepEqual(learningState(store), before);
+  assert.equal(countTraces(store), 1);
+  store.close();
+});
+
+test("collision: identical metadata (scope in another order) is accepted", () => {
+  const store = openStore();
+  store.prepareSubagentDispatch(dispatchInput({ envelope: envWith({ scope: ["b.ts", "a/c.ts"] }) }));
+  const r = store.prepareSubagentDispatch(dispatchInput({ toolCallId: "t2", inputHash: "h2", envelope: envWith({ scope: ["a/c.ts", "b.ts"], prompt: "new prompt" }) }));
+  assert.equal(r.reason, "selected");
+  assert.equal(countTraces(store), 2);
+  store.close();
+});
+
+test("collision: same directionArmId with different scope inside one batch is rejected", () => {
+  const store = openStore();
+  const a = dispatchInput({ itemIndex: 0, envelope: envWith({ scope: ["a.ts"] }) });
+  const b = dispatchInput({ itemIndex: 1, envelope: envWith({ scope: ["b.ts"] }) });
+  assert.throws(() => store.prepareSubagentDispatchBatch([a, b]), /directionId d1/);
+  assert.equal(countTraces(store), 0);
+  assert.equal(learningState(store).generation, 0);
+  store.close();
+});
+
+test("replay of a blocked batch returns selected null for every item", () => {
+  const store = openStore();
+  const dB = directionArmId("g1", null, "dB");
+  mutateState(store, (s) => { s.cooldowns[dB] = { excludedThroughOpportunity: 100, failures: 1 }; });
+  const items = [
+    dispatchInput({ itemIndex: 0, envelope: { version: 1, goalId: "g1", candidates: [spec(null, "dA")] } }),
+    dispatchInput({ itemIndex: 1, envelope: { version: 1, goalId: "g1", candidates: [spec(null, "dB")] } }),
+  ];
+  store.prepareSubagentDispatchBatch(items);
+  const before = learningState(store);
+  const replay = store.prepareSubagentDispatchBatch(items);
+  assert.ok(replay.every((r) => r.selected === null && r.reason === "all_excluded"));
+  assert.deepEqual(learningState(store), before);
+  store.close();
+});
