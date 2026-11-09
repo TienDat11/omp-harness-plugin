@@ -1379,6 +1379,36 @@ test("harness_record learning branch commits once, writes the projection, then t
   closeSkillTelemetryStores();
 });
 
+test("harness_record learning branch attaches metrics, fills wall_ms 0, and replay bytes stay identical", async () => {
+  const fx = await harnessRecordFixture();
+  const sessionFile = join(fx.cwd, "metrics-session.jsonl");
+  const writeSession = (reuseInput: number) => writeFileSync(sessionFile, [
+    JSON.stringify({ id: "s1", type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+    JSON.stringify({ id: "m1", parentId: "s1", type: "message", timestamp: "2026-01-01T00:00:10.000Z", message: { role: "assistant", provider: "ns24", model: "a", usage: { input: reuseInput, output: 1, cacheRead: 30, cacheWrite: 0, totalTokens: 40 } } }),
+  ].join("\n") + "\n", "utf8");
+  writeSession(10);
+  const prev = process.env.OMP_SESSION_FILE;
+  process.env.OMP_SESSION_FILE = sessionFile;
+  try {
+    const params = learningParams(fx, {}, { wall_ms: 0 });
+    await runHarnessRecord(fx.ctx, params);
+    const outcomeFile = join(fx.workDir, "outcome.json");
+    const bytes = readFileSync(outcomeFile, "utf8");
+    const outcome = JSON.parse(bytes);
+    assert.ok(outcome.metrics);
+    assert.equal(outcome.metrics.cache.provider, "ns24");
+    assert.equal(outcome.wall_ms, outcome.metrics.activeWallMs);
+    writeSession(999);
+    const again = await runHarnessRecord(fx.ctx, params);
+    assert.equal(again.details.replay, true);
+    assert.equal(readFileSync(outcomeFile, "utf8"), bytes, "replay keeps stored bytes");
+  } finally {
+    if (prev === undefined) delete process.env.OMP_SESSION_FILE;
+    else process.env.OMP_SESSION_FILE = prev;
+    closeSkillTelemetryStores();
+  }
+});
+
 test("harness_record: own post-commit flush failure reports committed + pending; another operation's pending projection reports NOT committed", async () => {
   const fx = await harnessRecordFixture();
   // Dispatch B before any projection is pending (a pending projection blocks learning dispatch).

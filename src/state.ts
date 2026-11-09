@@ -228,7 +228,7 @@ export function summarizeHarnessLog(text: string): string {
   for (const raw of lines) {
     const line = raw.trim();
     if (!line) continue;
-    const m = /^([SMWEG]\d)\s/.exec(line);
+    const m = /^([SMWEGC]\d)\s/.exec(line);
     if (!m) continue;
     const code = m[1];
     counts[code] = (counts[code] ?? 0) + 1;
@@ -271,6 +271,6 @@ export function summarizeHarnessLog(text: string): string {
   return [
     `turns=${counts.M1 ?? 0} mut=${sumMut} calls=${sumCalls} err=${sumErr} verify=${verify1}/${m1Count} avgR=${avgR.toFixed(2)}`,
     `skills: s1=${counts.S1 ?? 0} | workers: w1=${counts.W1 ?? 0} ready=${ready} fail=${fail} deg=${deg}`,
-    `errors(E1)=${ecSummary} | guards(G1)=${rcSummary} | alerts(W2)=${kSummary}`,
+    `errors(E1)=${ecSummary} | guards(G1)=${rcSummary} | alerts(W2)=${kSummary} | cache(C1)=${counts.C1 ?? 0}`,
   ].join("\n");
 }
