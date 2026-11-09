@@ -7,6 +7,7 @@ import path from "node:path";
 import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { detectStack, recommendSkills, fingerprintProject, installedSkillNames, installedSkillDirs, installedSkillFiles, loadSkillCorpus, loadAllowlist, saveAllowlist, missingSkillsForStack } from "../src/stack-router.ts";
 import stackRouter from "../src/stack-router.ts";
+import { getSkillTelemetryStore, closeSkillTelemetryStores } from "../src/skill-telemetry.ts";
 import { tmpDir, fakePi, fakeCtx, type FakePi, type FakeCtx } from "./_fake-pi.ts";
 import { summarizeHarnessLog as summarizeStateLog } from "../src/state.ts";
 
@@ -304,4 +305,30 @@ test("summarizeHarnessLog: W1 ready/fail/deg and W2 alerts rollup", () => {
   const summary = summarizeStateLog(sample);
   assert.ok(summary.includes("ready=1 fail=2 deg=2"), summary);
   assert.ok(summary.includes("alerts(W2)=30=1 36=1") || summary.includes("alerts(W2)=30=1"), summary);
+});
+
+test("session_shutdown returns early for subagents and closes shared stores for the main agent", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "omp-shutdown-"));
+  const pi = fakePi();
+  stackRouter(pi as never);
+  const store = getSkillTelemetryStore(dir);
+  assert.ok(store);
+  await fire(pi.handlers, "session_shutdown", {}, { ...fakeCtx(dir), agent: { kind: "sub" } });
+  assert.equal(getSkillTelemetryStore(dir), store, "subagent shutdown must not close the shared cache");
+  await fire(pi.handlers, "session_shutdown", {}, fakeCtx(dir));
+  const reopened = getSkillTelemetryStore(dir);
+  assert.ok(reopened);
+  assert.notEqual(reopened, store, "main shutdown closes and clears the cache");
+  closeSkillTelemetryStores();
+});
+
+test("skill-rate keeps null semantics when the telemetry store is unavailable", async () => {
+  const bad = join(mkdtempSync(join(tmpdir(), "omp-nostore-")), "file-not-dir");
+  writeFileSync(bad, "x");
+  const pi = fakePi();
+  stackRouter(pi as never);
+  const ctx = fakeCtx(bad);
+  await pi.commands.get("skill-rate")!.handler("status", ctx);
+  const calls = (ctx.ui.notify as unknown as { calls: Array<{ message: string }> }).calls;
+  assert.ok(calls.some((c) => c.message.includes("telemetry store unavailable")), JSON.stringify(calls));
 });

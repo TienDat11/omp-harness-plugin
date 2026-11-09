@@ -1,4 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import path from "node:path";
 import { MIN_SHADOW_SAMPLES } from "./skill-specs.ts";
 
 export interface SkillRunRecord {
@@ -171,4 +173,46 @@ export function isHardRevert(command: string): boolean {
   if (/\bgit\s+stash\s+drop\b/.test(c)) return true;
   if (/\bgit\s+restore\b(?!\s+--staged\b)/.test(c)) return true;
   return false;
+}
+
+const storeCache = new Map<string, SkillTelemetryStore>();
+
+function canonicalCwd(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  try {
+    return existsSync(resolved) ? realpathSync(resolved) : resolved;
+  } catch {
+    return resolved;
+  }
+}
+
+/** Shared per-cwd store. Constructor failure (locked or read-only workspace) returns null and is not cached. */
+export function getSkillTelemetryStore(cwd: string): SkillTelemetryStore | null {
+  const key = canonicalCwd(cwd);
+  const cached = storeCache.get(key);
+  if (cached) return cached;
+  try {
+    const dir = path.join(key, ".omp", "harness");
+    mkdirSync(dir, { recursive: true });
+    const store = new SkillTelemetryStore(path.join(dir, "skill-telemetry.db"));
+    storeCache.set(key, store);
+    return store;
+  } catch (err) {
+    console.error(`skill-telemetry: store unavailable for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+export function closeSkillTelemetryStores(): void {
+  try {
+    for (const store of storeCache.values()) {
+      try {
+        store.close();
+      } catch {
+        // Already closed.
+      }
+    }
+  } finally {
+    storeCache.clear();
+  }
 }
