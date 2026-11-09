@@ -1842,3 +1842,61 @@ test("F10 fix 2: learning failure on an existing ticket restores its targetPaths
   assert.equal(after.targetPaths.some((p) => p.includes("failed-only")), false);
   assert.equal(after.allowedPaths.some((p) => p.includes("failed-only")), false);
 });
+
+// ── Task 12: startup drain and legacy regression ──
+
+function spyDrain(dir: string, impl?: () => void): { calls: () => number } {
+  const store = getSkillTelemetryStore(dir)!;
+  assert.ok(store);
+  let n = 0;
+  store.drainPending = () => { n += 1; impl?.(); };
+  return { calls: () => n };
+}
+
+test("startup drain runs for parent only and does not throw on failure", async () => {
+  const host = learningHost();
+  const spy = spyDrain(host.dir);
+  await fire(host.pi, "session_start", {}, host.ctx);
+  assert.equal(spy.calls(), 1, "parent session_start drains once");
+  await fire(host.pi, "session_start", {}, { ...host.ctx, agent: { kind: "sub" } });
+  assert.equal(spy.calls(), 1, "sub session_start never drains");
+
+  await withHarnessLog(async (logFile) => {
+    const h2 = learningHost();
+    const spy2 = spyDrain(h2.dir, () => {
+      throw Object.assign(new Error("PROJECTION_PENDING: secret-payload-xyz"), { code: "PROJECTION_PENDING" });
+    });
+    await assert.doesNotReject(async () => { await fire(h2.pi, "session_start", {}, h2.ctx); });
+    assert.equal(spy2.calls(), 1);
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /PROJECTION_PENDING/);
+    assert.equal(log.includes("secret-payload-xyz"), false, "diagnostic carries the code, not payload text");
+  });
+});
+
+test("legacy dispatch is not blocked by pending outbox and creates no trace", async () => {
+  const host = learningHost();
+  assert.ok(getSkillTelemetryStore(host.dir));
+  const dbPath = join(host.dir, ".omp", "harness", "skill-telemetry.db");
+  const read = (): { traces: number; gen: number } => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const traces = Number((db.prepare("SELECT COUNT(*) c FROM dispatch_traces").get() as { c: number }).c);
+      const gen = Number((db.prepare("SELECT generation g FROM learning_state WHERE id=1").get() as { g: number }).g);
+      return { traces, gen };
+    } finally {
+      db.close();
+    }
+  };
+  const db = new DatabaseSync(dbPath);
+  try {
+    const pending = { dispatchId: "pending-1", sessionId: "s", outcome: { status: "pending", generation: 1, operationId: "op-1", destination: join(host.dir, "nowhere", "o.json"), outcomeJson: "{}" } };
+    db.prepare("INSERT INTO dispatch_traces(dispatch_id, payload_json, created_at) VALUES (?,?,?)").run("pending-1", JSON.stringify(pending), 1);
+  } finally {
+    db.close();
+  }
+  const before = read();
+  const r = await dispatch(host, "task", batchInput([{ assignment: "edit src/legacy.ts" }]), "legacy-1");
+  assert.notEqual(r?.block, true, JSON.stringify(r));
+  assert.deepEqual(read(), before, "no trace row and no generation change");
+});

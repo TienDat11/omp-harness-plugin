@@ -1528,6 +1528,27 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     return { replaced, final: { ...replaced, [field]: applyLearningBlocks(replaced[field] as string, contexts[0], false) }, prompts };
   };
 
+  /**
+   * Spec §9 startup drain (parent only, caller guards). Failure keeps the
+   * projection pending and logs the error code only; it never throws, so the
+   * session and legacy tools are unaffected.
+   */
+  const drainLearningOutbox = (rawCwd: string | undefined, cwd: string): void => {
+    try {
+      if (typeof rawCwd !== "string" || !path.isAbsolute(rawCwd)) return;
+      const store = getSkillTelemetryStore(cwd);
+      if (store === null) {
+        logHarnessCode(rawCwd as string, "W2 k=39 tl=session_start code=STORE_UNAVAILABLE");
+        return;
+      }
+      store.drainPending();
+    } catch (err) {
+      const raw = (err as { code?: unknown } | null)?.code;
+      const code = typeof raw === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(raw) ? raw : "DRAIN_FAILED";
+      logHarnessCode(rawCwd as string, `W2 k=39 tl=session_start code=${code}`);
+    }
+  };
+
   pi.on("session_start", (event, ctx) => {
     if (isSubagent(ctx)) return;
     const c = ctx as SuperagentHookContext | undefined;
@@ -1539,11 +1560,13 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     if (reason === "resume") {
       const restored = loadSuperagentSnapshot(cwd, key) ?? createSuperagentState();
       states.set(key, restored);
+      drainLearningOutbox(rawCwd, cwd);
       return;
     }
     const fresh = createSuperagentState();
     states.set(key, fresh);
     if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, fresh, now());
+    drainLearningOutbox(rawCwd, cwd);
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
