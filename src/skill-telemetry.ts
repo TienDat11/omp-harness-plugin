@@ -1,6 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { MIN_SHADOW_SAMPLES } from "./skill-specs.ts";
 
 export interface SkillRunRecord {
@@ -215,4 +216,246 @@ export function closeSkillTelemetryStores(): void {
   } finally {
     storeCache.clear();
   }
+}
+
+// ---- Subagent self-improvement: typed contract (spec §4) ----
+export type ArmId = string & { readonly __brand: "ArmId" };
+export type CriterionSet = { criterionIds: string[]; passed: boolean[] };
+export type ReportKind = "ready" | "failed" | "blocked" | "dropped";
+export interface CandidateSpec {
+  parentId: string | null;
+  directionId: string;
+  mechanism: string;
+  change: string;
+  scope: string[];
+  prompt: string;
+}
+export interface Candidate extends CandidateSpec {
+  parentArmId: ArmId;
+  directionArmId: ArmId;
+}
+export interface CandidateEnvelope {
+  version: 1;
+  goalId: string;
+  candidates: CandidateSpec[];
+}
+export interface Assessment {
+  dispatchId: string;
+  reportKind: ReportKind;
+  followed: boolean;
+  attributable: boolean;
+  allChecksCompleted: boolean;
+  measurementError: boolean;
+  baseline: CriterionSet;
+  candidate: CriterionSet;
+  evidenceRefs: Array<{ path: string; sha256: string }>;
+  changedPaths: string[];
+  availableAt: number;
+}
+export interface Observation {
+  observationId: string;
+  dispatchId: string;
+  target: "parent" | "direction";
+  armId: ArmId;
+  value: 0 | 1;
+  availableAt: number;
+}
+export interface FailureDirectionCard {
+  failureKey: string;
+  directionArmId: ArmId;
+  mechanism: string;
+  change: string;
+  scope: string[];
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+export interface Lesson {
+  lessonKey: ArmId;
+  kind: "successful_pattern" | "failure_pattern" | "conditional_guidance";
+  goalId: string;
+  appliesWhen: string;
+  mechanism: string;
+  recommendedChange: string;
+  targets: Array<{ file: string; change: string }>;
+  targetIndexes: number[];
+  reinforceCount: number;
+  contradictionCount: number;
+  firstSeenAt: number;
+  lastSeenAt: number;
+}
+export interface LearningStateJSON {
+  generation: number;
+  arms: Record<ArmId, { successes: number; n: number }>;
+  opportunityCounters: Record<ArmId, number>;
+  cooldowns: Record<ArmId, { excludedThroughOpportunity: number; failures: number }>;
+  cards: FailureDirectionCard[];
+  memory: {
+    lessons: Lesson[];
+    targetCatalog: Array<{ file: string; change: string }>;
+  };
+}
+export interface OutcomeProjection {
+  operationId: string;
+  requestHash: string;
+  operationHash: string;
+  destination: string;
+  outcomeJson: string;
+  generation: number;
+  status: "pending" | "flushed";
+}
+export interface Trace {
+  dispatchId: string;
+  sessionId: string;
+  toolCallId: string;
+  itemIndex: number;
+  ticketId: string;
+  agent: string;
+  goalId: string;
+  candidates: Candidate[];
+  selectedDirectionArmId: ArmId | null;
+  selectedPrompt: string;
+  inputHash: string;
+  memoryRevision: string;
+  memoryText: string;
+  createdAt: number;
+  assessmentStatus: "pending" | "applied" | "skipped" | "not_dispatched";
+  assessmentHash?: string;
+  evaluationOperationId?: string;
+  outcome?: OutcomeProjection;
+}
+export interface DispatchInput {
+  sessionId: string;
+  toolCallId: string;
+  itemIndex: number;
+  ticketId: string;
+  agent: string;
+  envelope: CandidateEnvelope;
+  inputHash: string;
+  now: number;
+}
+export interface DispatchResult {
+  trace: Trace;
+  selected: Candidate | null;
+  memoryText: string;
+  reason: "selected" | "all_excluded";
+}
+export interface CommitBatchInput {
+  operationId: string;
+  sessionId: string;
+  requestHash: string;
+  destination: string;
+  outcomeJson: string;
+  assessments: Assessment[];
+  now: number;
+}
+export interface CommitBatchResult {
+  generation: number;
+  status: "pending" | "flushed";
+  replay: boolean;
+}
+export interface SubagentLearningStore {
+  prepareSubagentDispatch(input: DispatchInput): DispatchResult;
+  prepareSubagentDispatchBatch(inputs: DispatchInput[]): DispatchResult[];
+  findEvaluationProjection(operationId: string, sessionId: string): OutcomeProjection | null;
+  commitSubagentEvaluationBatch(input: CommitBatchInput): CommitBatchResult;
+  drainPending(): void;
+}
+
+// ---- IDs: SHA-256 (hex) of UTF-8 JSON.stringify(array); first element is a domain tag ----
+export function hashId(parts: unknown[]): string {
+  return createHash("sha256").update(JSON.stringify(parts), "utf8").digest("hex");
+}
+export function parentArmId(goalId: string, parentId: string | null): ArmId {
+  return hashId(["parent-v1", goalId, parentId]) as ArmId;
+}
+export function directionArmId(goalId: string, parentId: string | null, directionId: string): ArmId {
+  return hashId(["arm-v1", goalId, parentId, directionId]) as ArmId;
+}
+export function dispatchId(sessionId: string, toolCallId: string, itemIndex: number): string {
+  return hashId(["dispatch-v1", sessionId, toolCallId, itemIndex]);
+}
+export function observationId(dispatchIdValue: string, target: "parent" | "direction", armId: ArmId): string {
+  return hashId(["observation-v1", dispatchIdValue, target, armId]);
+}
+export function failureKey(
+  goalId: string, parentId: string | null, directionId: string,
+  mechanism: string, change: string, scope: string[],
+): string {
+  return hashId(["failure-v1", goalId, parentId, directionId, mechanism, change, normalizeScope(scope)]);
+}
+
+// ---- Validation boundary (pure, no DB) ----
+export const MAX_CANDIDATES = 8;
+export const MAX_PROMPT_UNITS = 4000;
+export const MAX_FIELD_UNITS = 512;
+export const MAX_SCOPE_PATHS = 8;
+export const MAX_SCOPE_PATH_UNITS = 1024;
+
+function fail(field: string, why: string): never {
+  throw new RangeError(`${field}: ${why}`);
+}
+
+/** Repo-relative, slash-separated, no "..", unique, lexicographically sorted. */
+export function normalizeScope(scope: unknown, field = "scope"): string[] {
+  if (!Array.isArray(scope)) fail(field, "must be an array");
+  const out = new Set<string>();
+  for (const raw of scope) {
+    if (typeof raw !== "string") fail(field, "paths must be strings");
+    if (raw.length > MAX_SCOPE_PATH_UNITS) fail(field, `path exceeds ${MAX_SCOPE_PATH_UNITS} code units`);
+    if (raw.includes("\0")) fail(field, "path contains NUL");
+    const slashed = raw.replace(/\\/g, "/");
+    if (slashed.startsWith("/")) fail(field, `path must be repo-relative: ${raw}`);
+    if (/^[A-Za-z]:/.test(slashed)) fail(field, `path must not carry a drive: ${raw}`);
+    const segments: string[] = [];
+    for (const seg of slashed.split("/")) {
+      if (seg === "..") fail(field, `path must not traverse upward: ${raw}`);
+      if (seg === "" || seg === ".") continue;
+      segments.push(seg);
+    }
+    if (segments.length === 0) fail(field, "path must be nonempty");
+    out.add(segments.join("/"));
+  }
+  return [...out].sort();
+}
+
+function boundedString(value: unknown, field: string, max: number, trim: boolean): string {
+  if (typeof value !== "string") fail(field, "must be a string");
+  const v = trim ? value.trim() : value;
+  if (v.trim().length === 0) fail(field, "must be nonempty");
+  if (v.length > max) fail(field, `exceeds ${max} UTF-16 code units`);
+  return v;
+}
+
+export function validateCandidateSpec(raw: unknown, field = "candidate"): CandidateSpec {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail(field, "must be an object");
+  const r = raw as Record<string, unknown>;
+  const parentId = r.parentId === null ? null : boundedString(r.parentId, `${field}.parentId`, MAX_FIELD_UNITS, true);
+  const directionId = boundedString(r.directionId, `${field}.directionId`, MAX_FIELD_UNITS, true);
+  const mechanism = boundedString(r.mechanism, `${field}.mechanism`, MAX_FIELD_UNITS, false);
+  const change = boundedString(r.change, `${field}.change`, MAX_FIELD_UNITS, false);
+  const prompt = boundedString(r.prompt, `${field}.prompt`, MAX_PROMPT_UNITS, false);
+  if (!Array.isArray(r.scope)) fail(`${field}.scope`, "must be an array");
+  if (r.scope.length > MAX_SCOPE_PATHS) fail(`${field}.scope`, `exceeds ${MAX_SCOPE_PATHS} paths`);
+  const scope = normalizeScope(r.scope, `${field}.scope`);
+  return { parentId, directionId, mechanism, change, scope, prompt };
+}
+
+export function validateCandidateEnvelope(raw: unknown): CandidateEnvelope {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("envelope", "must be an object");
+  const r = raw as Record<string, unknown>;
+  if (r.version !== 1) fail("version", "must be 1");
+  const goalId = boundedString(r.goalId, "goalId", MAX_FIELD_UNITS, true);
+  if (!Array.isArray(r.candidates)) fail("candidates", "must be an array");
+  if (r.candidates.length < 1 || r.candidates.length > MAX_CANDIDATES) {
+    fail("candidates", `must contain 1-${MAX_CANDIDATES} items`);
+  }
+  const seen = new Set<string>();
+  const candidates = r.candidates.map((c, i) => {
+    const spec = validateCandidateSpec(c, `candidates[${i}]`);
+    const key = JSON.stringify([spec.parentId, spec.directionId]);
+    if (seen.has(key)) fail(`candidates[${i}]`, "duplicate (parentId, directionId)");
+    seen.add(key);
+    return spec;
+  });
+  return { version: 1, goalId, candidates };
 }
