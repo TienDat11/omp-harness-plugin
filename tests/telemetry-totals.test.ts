@@ -233,6 +233,46 @@ test("harness_record preserves fields unchanged when tokens and wall_ms are posi
   }
 });
 
+const metricsSession = (root: string) => writeJsonl(join(root, "session.jsonl"), [
+  JSON.stringify({ id: "s1", type: "session", timestamp: "2026-01-01T00:00:00.000Z" }),
+  JSON.stringify({ id: "m1", parentId: "s1", type: "message", timestamp: "2026-01-01T00:00:10.000Z", message: { role: "assistant", provider: "ns24", model: "model-a", usage: { input: 10, output: 5, cacheRead: 30, cacheWrite: 0, totalTokens: 45 } } }),
+]);
+
+async function recordWithEnv(sessionFile: string | undefined, wall_ms: number) {
+  const dir = tmpDir();
+  const prev = process.env.OMP_SESSION_FILE;
+  if (sessionFile === undefined) delete process.env.OMP_SESSION_FILE;
+  else process.env.OMP_SESSION_FILE = sessionFile;
+  try {
+    await harnessRecord(mountTools(), dir, { tier: "S", goal: "g", acceptance: [], models: [], tokens: 1000, wall_ms });
+    return JSON.parse(readFileSync(join(dir, "outcome.json"), "utf8")) as { wall_ms: number; metrics?: { activeWallMs: number; cache: { provider?: string; reuse: number }; stopBlocks: { total: number } } };
+  } finally {
+    if (prev === undefined) delete process.env.OMP_SESSION_FILE;
+    else process.env.OMP_SESSION_FILE = prev;
+  }
+}
+
+test("harness_record attaches metrics when a session file exists and replaces wall_ms 0", async () => {
+  const outcome = await recordWithEnv(metricsSession(tmpDir()), 0);
+  assert.ok(outcome.metrics);
+  assert.equal(outcome.metrics!.stopBlocks.total, 0);
+  assert.equal(outcome.metrics!.cache.provider, "ns24");
+  assert.equal(outcome.metrics!.cache.reuse, 0.75);
+  assert.equal(outcome.wall_ms, outcome.metrics!.activeWallMs);
+});
+
+test("harness_record keeps positive wall_ms but still attaches metrics", async () => {
+  const outcome = await recordWithEnv(metricsSession(tmpDir()), 5000);
+  assert.ok(outcome.metrics);
+  assert.equal(outcome.wall_ms, 5000);
+});
+
+test("harness_record adds no metrics key and leaves wall_ms alone without a session file", async () => {
+  const outcome = await recordWithEnv(undefined, 0);
+  assert.equal("metrics" in outcome, false);
+  assert.equal(outcome.wall_ms, 0);
+});
+
 // ---------------------------------------------------------------------------
 // F-05: vibe_spawn spawn counting + sessionTotals worker spawn sum
 // ---------------------------------------------------------------------------

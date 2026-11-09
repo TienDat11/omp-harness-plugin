@@ -4,7 +4,8 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { allowDestructive, allowSecret, writeTextFileAtomic } from "./state.ts";
-import { summarizeSessionFile, resolveSessionFile, type SessionTotals } from "./telemetry.ts";
+import { summarizeSessionFile, parseSessionText, resolveSessionFile, type SessionTotals } from "./telemetry.ts";
+import { summarizeSessionMetrics, type SessionMetrics } from "./session-metrics.ts";
 import { judge, parseReadinessBlock, readiness } from "./decisions.ts";
 import {
   getSkillTelemetryStore, subagentSessionKey, evaluationOperationId, evaluateAssessment,
@@ -13,7 +14,16 @@ import {
 } from "./skill-telemetry.ts";
 
 type Acceptance = { id: string; joint: string; check: string; pass: boolean; evidence: string; };
-type Outcome = { task: string; dir: string; tier: string; goal: string; acceptance: Acceptance[]; models: string[]; tokens: number; wall_ms: number; notes: string; sessionTelemetry?: SessionTotals; recorded_at: string; };
+type Outcome = { task: string; dir: string; tier: string; goal: string; acceptance: Acceptance[]; models: string[]; tokens: number; wall_ms: number; notes: string; sessionTelemetry?: SessionTotals; metrics?: SessionMetrics; recorded_at: string; };
+
+/** Parse the session file with the telemetry parser and measure it; undefined when unreadable. */
+function readSessionMetrics(sessionFile: string): SessionMetrics | undefined {
+  try {
+    return summarizeSessionMetrics(parseSessionText(readFileSync(sessionFile, "utf8")).entries);
+  } catch {
+    return undefined;
+  }
+}
 
 export interface DesignMisconception {
   similar_case: string;
@@ -404,14 +414,18 @@ function buildLearningOutcomeJson(params: LearningParams, dir: string, root: str
   const sessionFile = resolveSessionFile(ctx?.sessionManager?.getSessionFile?.(), root);
   let tokens = params.tokens;
   let sessionTelemetry: SessionTotals | undefined;
+  let metrics: SessionMetrics | undefined;
+  let wallMs = params.wall_ms;
   if (sessionFile !== "") {
     sessionTelemetry = summarizeSessionFile(sessionFile);
     if (tokens === 0 && sessionTelemetry.combined.totalTokens > 0) tokens = sessionTelemetry.combined.totalTokens;
+    metrics = readSessionMetrics(sessionFile);
+    if (metrics && !(wallMs > 0)) wallMs = metrics.activeWallMs;
   }
   const attachTelemetry = sessionTelemetry !== undefined && (sessionTelemetry.combined.totalTokens > 0 || sessionTelemetry.toolCalls > 0);
   const outcome = {
     task: path.basename(dir), dir, tier: params.tier, goal: params.goal, acceptance: params.acceptance, models: params.models,
-    tokens, wall_ms: params.wall_ms, notes: params.notes ?? "", sessionTelemetry: attachTelemetry ? sessionTelemetry : undefined,
+    tokens, wall_ms: wallMs, notes: params.notes ?? "", sessionTelemetry: attachTelemetry ? sessionTelemetry : undefined, metrics,
     subagentEvaluations: { operationId, dispatchIds }, recorded_at: new Date().toISOString(),
   };
   return JSON.stringify(outcome, null, 2);
@@ -493,12 +507,16 @@ export default function tools(pi: ExtensionAPI) {
       const sessionFile = resolveSessionFile(ctxSessionFile, root);
       let tokens = params.tokens;
       let sessionTelemetry: SessionTotals | undefined;
+      let metrics: SessionMetrics | undefined;
+      let wallMs = params.wall_ms;
       if (sessionFile !== "") {
         sessionTelemetry = summarizeSessionFile(sessionFile);
         if (tokens === 0 && sessionTelemetry.combined.totalTokens > 0) tokens = sessionTelemetry.combined.totalTokens;
+        metrics = readSessionMetrics(sessionFile);
+        if (metrics && !(wallMs > 0)) wallMs = metrics.activeWallMs;
       }
       const attachTelemetry = sessionTelemetry !== undefined && (sessionTelemetry.combined.totalTokens > 0 || sessionTelemetry.toolCalls > 0);
-      const outcome: Outcome = { task: path.basename(dir), dir, tier: params.tier, goal: params.goal, acceptance: params.acceptance, models: params.models, tokens, wall_ms: params.wall_ms, notes: params.notes ?? "", sessionTelemetry: attachTelemetry ? sessionTelemetry : undefined, recorded_at: new Date().toISOString() };
+      const outcome: Outcome = { task: path.basename(dir), dir, tier: params.tier, goal: params.goal, acceptance: params.acceptance, models: params.models, tokens, wall_ms: wallMs, notes: params.notes ?? "", sessionTelemetry: attachTelemetry ? sessionTelemetry : undefined, metrics, recorded_at: new Date().toISOString() };
       const file = path.join(dir, "outcome.json");
       writeTextFileAtomic(file, JSON.stringify(outcome, null, 2));
       const failed = outcome.acceptance.filter((a) => !a.pass).length;
