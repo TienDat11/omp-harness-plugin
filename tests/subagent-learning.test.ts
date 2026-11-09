@@ -9,6 +9,7 @@ import {
   SkillTelemetryStore, getSkillTelemetryStore, closeSkillTelemetryStores,
   parentArmId, directionArmId, dispatchId, observationId, failureKey,
   normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex, evaluateAssessment,
+  applyFailureCooldown, pruneExpiredCooldowns, capCards,
   type Assessment, type Trace,
 } from "../src/skill-telemetry.ts";
 
@@ -520,4 +521,47 @@ test("F4: criterion set mismatches and foreign dispatch throw RangeError", () =>
     { ...base, dispatchId: "other" },
   ];
   for (const a of bad) assert.throws(() => evaluateAssessment(trace, a), RangeError);
+});
+
+function emptyState() {
+  return { generation: 0, arms: {}, opportunityCounters: {}, cooldowns: {}, cards: [],
+    memory: { lessons: [], targetCatalog: [] } } as import("../src/skill-telemetry.ts").LearningStateJSON;
+}
+const cardFields = { mechanism: "m", change: "c", scope: ["a.ts"] };
+
+test("F6: failure sets cooldown T+3; prune keeps it through T+3 and drops at T+4", () => {
+  const s = applyFailureCooldown(emptyState(), "d", "k", cardFields, 5, 100);
+  assert.deepEqual(s.cooldowns.d, { excludedThroughOpportunity: 8, failures: 1 });
+  for (const t of [6, 7, 8]) assert.ok(pruneExpiredCooldowns(s, t).cooldowns.d, `T=${t} excluded`);
+  assert.equal(pruneExpiredCooldowns(s, 9).cooldowns.d, undefined);
+});
+
+test("F6: repeat failure within window does not renew cooldown; input not mutated", () => {
+  const s1 = applyFailureCooldown(emptyState(), "d", "k", cardFields, 5, 100);
+  const snap = JSON.stringify(s1);
+  const s2 = applyFailureCooldown(s1, "d", "k", cardFields, 6, 200);
+  assert.deepEqual(s2.cooldowns.d, { excludedThroughOpportunity: 8, failures: 1 });
+  assert.equal(JSON.stringify(s1), snap);
+  assert.equal(s2.cards.length, 1);
+  assert.equal(s2.cards[0].firstSeenAt, 100);
+  assert.equal(s2.cards[0].lastSeenAt, 200);
+});
+
+test("F6: expired cooldown is replaced by a fresh one", () => {
+  const s1 = applyFailureCooldown(emptyState(), "d", "k", cardFields, 5, 100);
+  const s2 = applyFailureCooldown(s1, "d", "k2", cardFields, 9, 300);
+  assert.deepEqual(s2.cooldowns.d, { excludedThroughOpportunity: 12, failures: 1 });
+});
+
+test("F6: card cap 50 evicts smallest lastSeenAt then lex-smallest key, never touches cooldowns", () => {
+  let s = emptyState();
+  for (let i = 0; i < 50; i += 1) s = applyFailureCooldown(s, `d${i}`, `k${String(i).padStart(2, "0")}`, cardFields, 1, 10);
+  assert.equal(s.cards.length, 50);
+  s = applyFailureCooldown(s, "dx", "kzz", cardFields, 1, 20);
+  assert.equal(s.cards.length, 50);
+  assert.ok(!s.cards.some((c) => c.failureKey === "k00"), "tie on lastSeenAt evicts lex-smallest");
+  assert.ok(s.cards.some((c) => c.failureKey === "kzz"));
+  assert.equal(Object.keys(s.cooldowns).length, 51);
+  assert.ok(s.cooldowns.d0, "evicted card keeps its active cooldown");
+  assert.equal(capCards(s.cards).length, 50);
 });

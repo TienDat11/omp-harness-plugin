@@ -718,3 +718,50 @@ export function evaluateAssessment(
     rows: [mk("parent", selected.parentArmId), mk("direction", selected.directionArmId)],
   };
 }
+
+export const CARD_CAP = 50;
+export const COOLDOWN_OPPORTUNITIES = 3;
+
+/** Evict from cards only (never cooldowns): smallest lastSeenAt, then lex-smallest failureKey. Pure. */
+export function capCards(cards: FailureDirectionCard[]): FailureDirectionCard[] {
+  const sorted = [...cards].sort((a, b) =>
+    b.lastSeenAt - a.lastSeenAt || (a.failureKey < b.failureKey ? 1 : a.failureKey > b.failureKey ? -1 : 0));
+  return sorted.slice(0, CARD_CAP).map((c) => ({ ...c, scope: [...c.scope] }));
+}
+
+/** Remove cooldown entries whose excludedThroughOpportunity < currentT (T exceeded it). Pure. */
+export function pruneExpiredCooldowns(state: LearningStateJSON, currentT: number): LearningStateJSON {
+  const cooldowns: LearningStateJSON["cooldowns"] = {};
+  for (const [arm, cd] of Object.entries(state.cooldowns)) {
+    if (!(cd.excludedThroughOpportunity < currentT)) cooldowns[arm] = { ...cd };
+  }
+  return { ...state, cooldowns };
+}
+
+/**
+ * Record an eligible non-improving terminal failure. Upserts the card by failureKey
+ * (firstSeenAt kept, lastSeenAt updated), caps cards, and sets the direction cooldown to
+ * currentT + 3 only when no live entry exists; a live entry is never renewed. Pure.
+ */
+export function applyFailureCooldown(
+  state: LearningStateJSON,
+  directionArm: ArmId,
+  key: string,
+  card: { mechanism: string; change: string; scope: string[] },
+  currentT: number,
+  now: number,
+): LearningStateJSON {
+  const existing = state.cards.some((c) => c.failureKey === key);
+  const upserted: FailureDirectionCard[] = existing
+    ? state.cards.map((c) => (c.failureKey === key ? { ...c, lastSeenAt: now } : c))
+    : [...state.cards, {
+        failureKey: key, directionArmId: directionArm, mechanism: card.mechanism,
+        change: card.change, scope: [...card.scope], firstSeenAt: now, lastSeenAt: now,
+      }];
+  const cooldowns = { ...state.cooldowns };
+  const cur = Object.prototype.hasOwnProperty.call(cooldowns, directionArm) ? cooldowns[directionArm] : undefined;
+  if (!cur || cur.excludedThroughOpportunity < currentT) {
+    cooldowns[directionArm] = { excludedThroughOpportunity: currentT + COOLDOWN_OPPORTUNITIES, failures: 1 };
+  }
+  return { ...state, cards: capCards(upserted), cooldowns };
+}
