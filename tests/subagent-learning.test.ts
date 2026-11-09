@@ -10,7 +10,8 @@ import {
   parentArmId, directionArmId, dispatchId, observationId, failureKey,
   normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex, evaluateAssessment,
   applyFailureCooldown, pruneExpiredCooldowns, capCards,
-  type Assessment, type Trace,
+  applyEvaluationToState, getSubagentPolicyMemory,
+  type Assessment, type Trace, type LearningStateJSON,
 } from "../src/skill-telemetry.ts";
 
 function tempCwd(): string { return mkdtempSync(join(tmpdir(), "learn-")); }
@@ -255,8 +256,8 @@ test("F3: distinct parents produce distinct parentArmIds; cold tie resolves lexi
   const arms = r.trace.candidates.map((c) => c.directionArmId).sort();
   assert.equal(r.selected!.directionArmId, arms[0]);
   assert.equal(r.trace.assessmentStatus, "pending");
-  assert.equal(r.trace.memoryRevision, "none");
-  assert.equal(r.trace.memoryText, "");
+  assert.match(r.trace.memoryRevision, /^[0-9a-f]{64}$/);
+  assert.ok(r.trace.memoryText.includes(r.trace.memoryRevision));
   const again = store.prepareSubagentDispatch(dispatchInput({ toolCallId: "t2", envelope: envTwoParents() }));
   assert.equal(again.trace.candidates.length, 2);
   store.close();
@@ -572,4 +573,140 @@ test("F6: card cap 50 evicts smallest lastSeenAt then lex-smallest key, never to
   assert.equal(Object.keys(s.cooldowns).length, 51);
   assert.ok(s.cooldowns.d0, "evicted card keeps its active cooldown");
   assert.equal(capCards(s.cards).length, 50);
+});
+
+// ---- Task 8: deterministic memory and bounded rendering ----
+function memTrace(directionId: string, o: { goalId?: string; scope?: string[]; change?: string } = {}): Trace {
+  const goalId = o.goalId ?? "g1";
+  const c = {
+    parentId: "p1", directionId, mechanism: "mech", change: o.change ?? `change-${directionId}`,
+    scope: o.scope ?? ["src/a.ts"], prompt: "p",
+    parentArmId: parentArmId(goalId, "p1"), directionArmId: directionArmId(goalId, "p1", directionId),
+  };
+  return { dispatchId: `disp-${directionId}`, goalId, candidates: [c], selectedDirectionArmId: c.directionArmId } as unknown as Trace;
+}
+function memAssessment(t: Trace, kind: "ready" | "failed", pass: boolean[], base: boolean[], changed: string[] = []): Assessment {
+  const ids = pass.map((_, i) => `c${i + 1}`);
+  return {
+    dispatchId: t.dispatchId, reportKind: kind, followed: true, attributable: true, allChecksCompleted: true,
+    measurementError: false, baseline: { criterionIds: ids, passed: base }, candidate: { criterionIds: ids, passed: pass },
+    evidenceRefs: [{ path: "x", sha256: "y" }], changedPaths: changed, availableAt: 1,
+  };
+}
+const successEval = (t: Trace) => memAssessment(t, "ready", [true, true], [false, false]);
+const failureEval = (t: Trace) => memAssessment(t, "failed", [false, false], [false, false]);
+const partialEval = (t: Trace) => memAssessment(t, "failed", [true, false], [false, false]);
+const applyEvaluation = (s: LearningStateJSON, t: Trace, a: Assessment, now = 10) => applyEvaluationToState(s, t, a, now);
+function extractBody(text: string): string {
+  const lines = text.split("\n");
+  assert.equal(lines[0], "<subagent-policy-memory>");
+  assert.equal(lines[lines.length - 1], "</subagent-policy-memory>");
+  assert.match(lines[1], /^revision:[0-9a-f]{64}$/);
+  return lines.slice(2, -1).join("\n");
+}
+function applyMany(s: LearningStateJSON, n: number): LearningStateJSON {
+  for (let i = 0; i < n; i += 1) {
+    const t = memTrace(`d${i}`, { scope: [`src/f${i}.ts`, `src/g${i}.ts`] });
+    s = applyEvaluation(s, t, successEval(t), 100 + i);
+  }
+  return s;
+}
+function bigState(): LearningStateJSON {
+  let s = emptyState();
+  for (let i = 0; i < 6; i += 1) {
+    const t = memTrace(`d${i}`, { change: "x".repeat(400) + `<script>${i}`, scope: [`src/f${i}.ts`] });
+    s = applyEvaluation(s, t, successEval(t), 100 + i);
+  }
+  for (let i = 0; i < 20; i += 1) s.cooldowns[`arm${i}` as never] = { excludedThroughOpportunity: 9, failures: 1 };
+  return s;
+}
+
+test("F9: success, failure and conditional lessons with reinforce/contradict/retire", () => {
+  const t = memTrace("d1");
+  let s = applyEvaluation(emptyState(), t, successEval(t));
+  assert.equal(s.memory.lessons[0].kind, "successful_pattern");
+  assert.equal(s.memory.lessons[0].reinforceCount, 1);
+  s = applyEvaluation(s, t, successEval(t), 11);
+  assert.equal(s.memory.lessons[0].reinforceCount, 2);
+  s = applyEvaluation(s, t, failureEval(t), 12);
+  assert.equal(s.memory.lessons[0].contradictionCount, 1);
+  s = applyEvaluation(s, t, failureEval(t), 13);
+  assert.equal(s.memory.lessons[0].contradictionCount, 2);
+  s = applyEvaluation(s, t, failureEval(t), 14);
+  assert.equal(s.memory.lessons.length, 0, "retire only, not recreated by the same assessment");
+  assert.equal(s.memory.targetCatalog.length, 0);
+
+  const f = applyEvaluation(emptyState(), t, failureEval(t));
+  assert.equal(f.memory.lessons[0].kind, "failure_pattern");
+  assert.equal(f.memory.lessons[0].recommendedChange, "Avoid change-d1; choose another direction");
+  const c1 = applyEvaluation(emptyState(), t, partialEval(t));
+  assert.equal(c1.memory.lessons[0].kind, "conditional_guidance");
+  assert.equal(c1.memory.lessons[0].recommendedChange, "Improved some criteria; remaining criteria must pass: c2");
+  const c2 = applyEvaluation(c1, t, partialEval(t), 20);
+  assert.equal(c2.memory.lessons[0].reinforceCount, 2);
+  const changed = memAssessment(t, "failed", [true, true, false], [false, false, false]);
+  const c3 = applyEvaluation(c1, t, changed, 30);
+  assert.equal(c3.memory.lessons[0].reinforceCount, 1, "new guidance resets");
+  assert.match(c3.memory.lessons[0].recommendedChange, /c3$/);
+});
+
+test("F9: SKIP leaves memory untouched and reducer does not mutate input", () => {
+  const t = memTrace("d1");
+  const s0 = applyEvaluation(emptyState(), t, successEval(t));
+  const snap = JSON.stringify(s0);
+  const s1 = applyEvaluation(s0, t, { ...failureEval(t), followed: false });
+  assert.equal(JSON.stringify(s1), snap);
+  applyEvaluation(s0, t, failureEval(t), 50);
+  assert.equal(JSON.stringify(s0), snap);
+});
+
+test("F9: cap 6 lessons and 8 targets; no dangling targetIndexes", () => {
+  const s = applyMany(emptyState(), 10);
+  assert.equal(s.memory.lessons.length, 6);
+  assert.deepEqual(s.memory.lessons.map((l) => l.firstSeenAt).sort(), [104, 105, 106, 107, 108, 109]);
+  assert.ok(s.memory.targetCatalog.length <= 8);
+  for (const l of s.memory.lessons) for (const i of l.targetIndexes) assert.ok(i < s.memory.targetCatalog.length);
+  const files = s.memory.targetCatalog.map((x) => x.file);
+  assert.deepEqual(files, [...files].sort());
+  const t = memTrace("big", { scope: Array.from({ length: 8 }, (_, i) => `a${i}.ts`) });
+  const b = applyEvaluation(emptyState(), t, memAssessment(t, "ready", [true], [false], ["z1.ts", "z2.ts"]));
+  assert.equal(b.memory.lessons[0].targets.length, 8);
+});
+
+test("F9: render within 8192 UTF-16 including tags, < escaped, valid JSON after trim", () => {
+  const text = getSubagentPolicyMemory(bigState(), "g1", 8192);
+  assert.ok(text.length <= 8192);
+  assert.ok(!text.slice(text.indexOf("<subagent-policy-memory>") + 1).includes("<script"));
+  assert.ok(text.includes("\\u003cscript"));
+  assert.ok(!extractBody(text).includes("<"));
+  const body = JSON.parse(extractBody(text));
+  assert.ok(Array.isArray(body.lessons));
+  assert.equal(body.cooldowns.length + body.excludedCount, 20);
+
+  const small = getSubagentPolicyMemory(bigState(), "g1", 600);
+  assert.ok(small.length <= 600);
+  assert.ok(JSON.parse(extractBody(small)).lessons.length < 6);
+  const fallback = getSubagentPolicyMemory(bigState(), "g1", 256);
+  assert.ok(fallback.length <= 256);
+  assert.equal(JSON.parse(extractBody(fallback)).lessons.length, 0);
+  assert.equal(JSON.parse(extractBody(getSubagentPolicyMemory(bigState(), "other"))).lessons.length, 0);
+  assert.throws(() => getSubagentPolicyMemory(bigState(), "g1", 100), RangeError);
+});
+
+test("F9: same state renders the same revision and text", () => {
+  assert.equal(getSubagentPolicyMemory(bigState(), "g1"), getSubagentPolicyMemory(bigState(), "g1"));
+  const a = getSubagentPolicyMemory(emptyState(), "g1");
+  const b = getSubagentPolicyMemory({ ...emptyState(), generation: 9 }, "g1");
+  assert.equal(a, b, "generation-only change keeps revision");
+});
+
+test("F9: dispatch trace stores revision and text rendered from fresh state for the goal", () => {
+  const store = openStore();
+  const t = memTrace("d0");
+  mutateState(store, (st) => { Object.assign(st, applyEvaluation(st, t, successEval(t))); });
+  const r = store.prepareSubagentDispatch(dispatchInput({ envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d1")] } }));
+  assert.equal(r.trace.memoryText, getSubagentPolicyMemory(learningState(store), "g1"));
+  assert.match(r.trace.memoryText, /successful_pattern/);
+  assert.match(r.trace.memoryRevision, /^[0-9a-f]{64}$/);
+  assert.ok(r.trace.memoryText.includes(r.trace.memoryRevision));
 });

@@ -52,9 +52,10 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
     return { generation: row.generation, payload: payload as Record<string, unknown> & { generation: number } };
   }
 
-  /** Single place for the dispatch memory trace values; Task 8 replaces the placeholder with rendered memory. */
-  private dispatchMemorySnapshot(_state: LearningStateJSON): { memoryRevision: string; memoryText: string } {
-    return { memoryRevision: "none", memoryText: "" };
+  /** Single place for the dispatch memory trace values: rendered from the fresh state for the envelope goal. */
+  private dispatchMemorySnapshot(state: LearningStateJSON, goalId: string): { memoryRevision: string; memoryText: string } {
+    const { revision, text } = renderPolicyMemory(state, goalId, DEFAULT_MEMORY_CHARS);
+    return { memoryRevision: revision, memoryText: text };
   }
 
   /** No-op until the pending-projection drain lands; always called under the writer lock. */
@@ -110,7 +111,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
     return { ...input, envelope: validateCandidateEnvelope(input.envelope) };
   }
 
-  private selectSubagentDirection(state: LearningStateJSON, input: DispatchInput, memory: { memoryRevision: string; memoryText: string }): DispatchResult {
+  private selectSubagentDirection(state: LearningStateJSON, input: DispatchInput): DispatchResult {
     const own = (rec: object, k: string): boolean => Object.prototype.hasOwnProperty.call(rec, k);
     const bump = (arm: ArmId): number => {
       const cur = own(state.opportunityCounters, arm) ? state.opportunityCounters[arm] : 0;
@@ -119,6 +120,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
       return cur + 1;
     };
     const goalId = input.envelope.goalId;
+    const memory = this.dispatchMemorySnapshot(state, goalId);
     const candidates: Candidate[] = input.envelope.candidates.map((c) => ({
       ...c,
       parentArmId: parentArmId(goalId, c.parentId),
@@ -175,7 +177,6 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
       this.drainPending();
       const row = this.readLearningStateRow();
       const state = this.hydrateLearningState();
-      const memory = this.dispatchMemorySnapshot(state);
       const getTrace = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`);
       const results: Array<DispatchResult | null> = valid.map(() => null);
       const fresh = new Set<number>();
@@ -195,7 +196,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
       });
       if (fresh.size === 0) return results as DispatchResult[];
       this.checkCandidateCollisions(valid.filter((_, i) => fresh.has(i)));
-      for (const i of fresh) results[i] = this.selectSubagentDirection(state, valid[i], memory);
+      for (const i of fresh) results[i] = this.selectSubagentDirection(state, valid[i]);
       const out = results as DispatchResult[];
       if (out.some((r, i) => fresh.has(i) && r.reason === "all_excluded")) {
         // A blocked tool call dispatches nothing: keep every selection, mark unsent items not_dispatched.
@@ -769,4 +770,121 @@ export function applyFailureCooldown(
     failures: live ? cur.failures + 1 : 1,
   };
   return { ...state, cards: capCards(upserted), cooldowns };
+}
+
+// ---- Deterministic memory (spec §8): pure reducer and renderer, no DB access ----
+export const LESSON_CAP = 6;
+export const TARGETS_PER_LESSON = 8;
+export const TARGET_CATALOG_CAP = 8;
+export const DEFAULT_MEMORY_CHARS = 8192;
+export const MIN_MEMORY_CHARS = 256;
+const MEMORY_COOLDOWNS_MAX = 8;
+const MEMORY_OPEN_TAG = "<subagent-policy-memory>";
+const MEMORY_CLOSE_TAG = "</subagent-policy-memory>";
+
+const lexCmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+const newestFirst = (a: Lesson, b: Lesson): number => b.lastSeenAt - a.lastSeenAt || lexCmp(a.lessonKey, b.lessonKey);
+
+/** Rebuild targetCatalog and targetIndexes from retained lessons (file-lex indexes, no dangling). Pure. */
+function rebuildTargetCatalog(lessons: Lesson[]): { lessons: Lesson[]; targetCatalog: Array<{ file: string; change: string }> } {
+  const byFile = new Map<string, string>();
+  for (const l of [...lessons].sort(newestFirst)) {
+    for (const t of l.targets) if (!byFile.has(t.file)) byFile.set(t.file, t.change);
+  }
+  const files = [...byFile.keys()].sort(lexCmp).slice(0, TARGET_CATALOG_CAP);
+  const index = new Map(files.map((f, i) => [f, i]));
+  const targetCatalog = files.map((file) => ({ file, change: byFile.get(file)! }));
+  const out = lessons.map((l) => ({
+    ...l,
+    targets: l.targets.map((t) => ({ ...t })),
+    targetIndexes: [...new Set(l.targets.map((t) => t.file))].sort(lexCmp)
+      .filter((f) => index.has(f)).map((f) => index.get(f)!),
+  }));
+  return { lessons: out, targetCatalog };
+}
+
+/**
+ * Apply one assessment to the lesson memory (spec §8). SKIP returns the state unchanged. Only
+ * memory.lessons/targetCatalog change; arms, cards and cooldowns are the caller's (Task 9). Pure.
+ */
+export function applyEvaluationToState(
+  state: LearningStateJSON,
+  trace: Pick<Trace, "dispatchId" | "candidates" | "selectedDirectionArmId" | "goalId">,
+  assessment: Assessment,
+  now: number,
+): LearningStateJSON {
+  const ev = evaluateAssessment(trace, assessment);
+  if (ev.kind === "skip") return state;
+  const selected = trace.candidates.find((c) => c.directionArmId === trace.selectedDirectionArmId)!;
+  let kind: Lesson["kind"];
+  let guidance: string;
+  if (ev.kind === "terminal_success") {
+    kind = "successful_pattern";
+    guidance = `Use ${selected.change}`;
+  } else if (ev.delta > 0) {
+    kind = "conditional_guidance";
+    const failed = assessment.candidate.criterionIds.filter((_, i) => !assessment.candidate.passed[i]);
+    guidance = `Improved some criteria; remaining criteria must pass: ${failed.join(", ")}`;
+  } else {
+    kind = "failure_pattern";
+    guidance = `Avoid ${selected.change}; choose another direction`;
+  }
+  const key = selected.directionArmId;
+  const existing = state.memory.lessons.find((l) => l.lessonKey === key);
+  const others = state.memory.lessons.filter((l) => l.lessonKey !== key);
+
+  let next: Lesson | null;
+  if (existing && existing.contradictionCount > 0 && existing.contradictionCount >= existing.reinforceCount) {
+    next = null; // this assessment only retires the lesson
+  } else {
+    const files = [...new Set([...selected.scope, ...assessment.changedPaths])].sort(lexCmp).slice(0, TARGETS_PER_LESSON);
+    const fresh: Lesson = {
+      lessonKey: key, kind, goalId: trace.goalId,
+      appliesWhen: `parent ${selected.parentId ?? "none"}; direction ${selected.directionId}`,
+      mechanism: selected.mechanism, recommendedChange: guidance,
+      targets: files.map((file) => ({ file, change: selected.change })), targetIndexes: [],
+      reinforceCount: 1, contradictionCount: 0, firstSeenAt: now, lastSeenAt: now,
+    };
+    if (!existing) next = fresh;
+    else if (existing.kind === kind && existing.recommendedChange === guidance) {
+      next = { ...fresh, firstSeenAt: existing.firstSeenAt, reinforceCount: existing.reinforceCount + 1, contradictionCount: existing.contradictionCount };
+    } else if (kind === "conditional_guidance" && existing.kind === "conditional_guidance") {
+      next = fresh; // guidance changed: reset as a new lesson
+    } else {
+      // Opposite outcome: keep the established lesson, count the contradiction.
+      next = { ...existing, targets: existing.targets.map((t) => ({ ...t })), contradictionCount: existing.contradictionCount + 1, lastSeenAt: now };
+    }
+  }
+  const all = (next ? [...others, next] : others).sort(newestFirst).slice(0, LESSON_CAP);
+  const rebuilt = rebuildTargetCatalog(all);
+  return { ...state, memory: { lessons: rebuilt.lessons, targetCatalog: rebuilt.targetCatalog } };
+}
+
+function serializeMemoryBody(body: unknown): string {
+  return JSON.stringify(body).replace(/</g, "\\u003c");
+}
+
+function renderPolicyMemory(state: LearningStateJSON, goalId: string, maxChars: number): { revision: string; text: string } {
+  if (!Number.isSafeInteger(maxChars) || maxChars < MIN_MEMORY_CHARS) throw new RangeError("maxChars must be an integer >= 256");
+  const catalog = state.memory.targetCatalog;
+  const lessons = state.memory.lessons.filter((l) => l.goalId === goalId).sort(newestFirst).map((l) => ({
+    kind: l.kind, appliesWhen: l.appliesWhen, mechanism: l.mechanism, recommendedChange: l.recommendedChange,
+    targets: l.targetIndexes.filter((i) => i < catalog.length).map((i) => ({ file: catalog[i].file, change: catalog[i].change })),
+  }));
+  const allCooldowns = Object.keys(state.cooldowns).sort(lexCmp);
+  let cooldowns = allCooldowns.slice(0, MEMORY_COOLDOWNS_MAX);
+  const build = (): { revision: string; text: string } => {
+    const body = serializeMemoryBody({ lessons, cooldowns, excludedCount: allCooldowns.length - cooldowns.length });
+    const revision = hashId(["policy-memory-v1", body]);
+    return { revision, text: `${MEMORY_OPEN_TAG}\nrevision:${revision}\n${body}\n${MEMORY_CLOSE_TAG}` };
+  };
+  let out = build();
+  while (out.text.length > maxChars && lessons.length > 0) { lessons.pop(); out = build(); }
+  while (out.text.length > maxChars && cooldowns.length > 0) { cooldowns = cooldowns.slice(0, -1); out = build(); }
+  return out;
+}
+
+/** Pure bounded renderer: <= maxChars UTF-16 units including tags and revision; `<` escaped as <. */
+export function getSubagentPolicyMemory(state: LearningStateJSON, goalId: string, maxChars: number = DEFAULT_MEMORY_CHARS): string {
+  return renderPolicyMemory(state, goalId, maxChars).text;
 }
