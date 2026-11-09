@@ -206,3 +206,177 @@ test("F2: KL-UCB values and domain checks", () => {
   }
   assert.ok(klUcbIndex(8, 10, 20) > klUcbIndex(2, 10, 20));
 });
+
+// ---- Task 5: dispatch selection ----
+const storePaths = new Map<SkillTelemetryStore, string>();
+function openStore(): SkillTelemetryStore {
+  const dbPath = dbPathFor(tempCwd());
+  const store = new SkillTelemetryStore(dbPath);
+  storePaths.set(store, dbPath);
+  return store;
+}
+function withRawDb<R>(store: SkillTelemetryStore, fn: (db: DatabaseSync) => R): R {
+  const db = new DatabaseSync(storePaths.get(store)!);
+  try { return fn(db); } finally { db.close(); }
+}
+function learningState(store: SkillTelemetryStore): any {
+  return withRawDb(store, (db) => JSON.parse((db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string }).p));
+}
+function mutateState(store: SkillTelemetryStore, fn: (s: any) => void): void {
+  withRawDb(store, (db) => {
+    const s = JSON.parse((db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string }).p);
+    fn(s);
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(s));
+  });
+}
+function countObservations(store: SkillTelemetryStore): number {
+  return withRawDb(store, (db) => (db.prepare("SELECT COUNT(*) c FROM observations").get() as { c: number }).c);
+}
+function countTraces(store: SkillTelemetryStore): number {
+  return withRawDb(store, (db) => (db.prepare("SELECT COUNT(*) c FROM dispatch_traces").get() as { c: number }).c);
+}
+function spec(parentId: string | null, directionId: string) {
+  return { parentId, directionId, mechanism: `m-${directionId}`, change: `c-${directionId}`, scope: ["a.ts"], prompt: `do ${directionId}` };
+}
+function envTwoParents() { return { version: 1 as const, goalId: "g1", candidates: [spec("p1", "d1"), spec("p2", "d1")] }; }
+function envOneDirection() { return { version: 1 as const, goalId: "g1", candidates: [spec(null, "d1")] }; }
+function dispatchInput(over: Record<string, unknown> = {}): any {
+  return { sessionId: "s1", toolCallId: "t1", itemIndex: 0, ticketId: "tk", agent: "worker", envelope: envOneDirection(), inputHash: "h1", now: 1000, ...over };
+}
+
+test("F3: distinct parents produce distinct parentArmIds; cold tie resolves lexically", () => {
+  const store = openStore();
+  const r = store.prepareSubagentDispatch(dispatchInput({ envelope: envTwoParents() }));
+  assert.equal(r.reason, "selected");
+  assert.ok(r.selected);
+  assert.notEqual(r.trace.candidates[0].parentArmId, r.trace.candidates[1].parentArmId);
+  const arms = r.trace.candidates.map((c) => c.directionArmId).sort();
+  assert.equal(r.selected!.directionArmId, arms[0]);
+  assert.equal(r.trace.assessmentStatus, "pending");
+  assert.equal(r.trace.memoryRevision, "none");
+  assert.equal(r.trace.memoryText, "");
+  const again = store.prepareSubagentDispatch(dispatchInput({ toolCallId: "t2", envelope: envTwoParents() }));
+  assert.equal(again.trace.candidates.length, 2);
+  store.close();
+});
+
+test("selection: counters increment once per distinct parent and direction; higher parent index wins", () => {
+  const store = openStore();
+  const env = { version: 1 as const, goalId: "g1", candidates: [spec("p1", "d1"), spec("p1", "d2"), spec("p2", "d1")] };
+  const pArm1 = parentArmId("g1", "p1");
+  const pArm2 = parentArmId("g1", "p2");
+  mutateState(store, (s) => { s.opportunityCounters[pArm1] = 5; s.arms[pArm1] = { successes: 0, n: 5 }; });
+  const r = store.prepareSubagentDispatch(dispatchInput({ envelope: env }));
+  assert.equal(r.selected!.parentArmId, pArm2); // cold parent index 1 beats failing p1
+  const st = learningState(store);
+  assert.equal(st.opportunityCounters[pArm1], 6);
+  assert.equal(st.opportunityCounters[pArm2], 1);
+  assert.equal(Object.keys(st.opportunityCounters).length, 2 + 3);
+  assert.equal(st.generation, 1);
+  store.close();
+});
+
+test("F5: same dispatchId and same inputHash replays without touching T or n", () => {
+  const store = openStore();
+  const a = store.prepareSubagentDispatch(dispatchInput({}));
+  const before = learningState(store);
+  const b = store.prepareSubagentDispatch(dispatchInput({}));
+  assert.deepEqual(b.trace, a.trace);
+  assert.equal(b.selected?.directionArmId, a.selected?.directionArmId);
+  assert.deepEqual(learningState(store), before);
+  assert.equal(countTraces(store), 1);
+  store.close();
+});
+
+test("F5: same dispatchId with different inputHash rejects before any mutation", () => {
+  const store = openStore();
+  store.prepareSubagentDispatch(dispatchInput({}));
+  const before = learningState(store);
+  assert.throws(() => store.prepareSubagentDispatch(dispatchInput({ inputHash: "other" })), /dispatch conflict/);
+  assert.deepEqual(learningState(store), before);
+  store.close();
+});
+
+test("F6: all-excluded persists trace and counters, returns all_excluded, no observation", () => {
+  const store = openStore();
+  const dArm = directionArmId("g1", null, "d1");
+  mutateState(store, (s) => { s.cooldowns[dArm] = { excludedThroughOpportunity: 100, failures: 1 }; });
+  const r = store.prepareSubagentDispatch(dispatchInput({ envelope: envOneDirection() }));
+  assert.equal(r.reason, "all_excluded");
+  assert.equal(r.selected, null);
+  assert.equal(r.trace.assessmentStatus, "not_dispatched");
+  assert.equal(r.trace.selectedDirectionArmId, null);
+  assert.equal(r.trace.selectedPrompt, "");
+  assert.equal(countObservations(store), 0);
+  assert.equal(countTraces(store), 1);
+  const st = learningState(store);
+  assert.equal(st.opportunityCounters[dArm], 1);
+  assert.equal(st.generation, 1);
+  const replay = store.prepareSubagentDispatch(dispatchInput({ envelope: envOneDirection() }));
+  assert.equal(replay.reason, "all_excluded");
+  assert.equal(learningState(store).opportunityCounters[dArm], 1);
+  store.close();
+});
+
+test("cooldown: excluded while T <= excludedThroughOpportunity, eligible at next opportunity", () => {
+  const store = openStore();
+  const dArm = directionArmId("g1", null, "d1");
+  mutateState(store, (s) => { s.cooldowns[dArm] = { excludedThroughOpportunity: 3, failures: 1 }; });
+  const reasons = [1, 2, 3, 4].map((i) => store.prepareSubagentDispatch(dispatchInput({ toolCallId: `c${i}` })).reason);
+  assert.deepEqual(reasons, ["all_excluded", "all_excluded", "all_excluded", "selected"]);
+  assert.equal(learningState(store).cooldowns[dArm], undefined);
+  store.close();
+});
+
+test("batch: any item all-excluded persists every item's selection and counters; none is dispatched", () => {
+  const store = openStore();
+  const dB = directionArmId("g1", null, "dB");
+  mutateState(store, (s) => { s.cooldowns[dB] = { excludedThroughOpportunity: 100, failures: 1 }; });
+  const itemA = dispatchInput({ itemIndex: 0, envelope: { version: 1, goalId: "g1", candidates: [spec(null, "dA")] } });
+  const itemB = dispatchInput({ itemIndex: 1, envelope: { version: 1, goalId: "g1", candidates: [spec(null, "dB")] } });
+  const results = store.prepareSubagentDispatchBatch([itemA, itemB]);
+  assert.equal(results.length, 2);
+  assert.equal(results[0].reason, "selected");
+  assert.equal(results[1].reason, "all_excluded");
+  assert.ok(results.every((x) => x.trace.assessmentStatus === "not_dispatched"));
+  assert.equal(results[0].trace.selectedDirectionArmId, directionArmId("g1", null, "dA"));
+  assert.equal(countTraces(store), 2);
+  assert.equal(countObservations(store), 0);
+  const st = learningState(store);
+  assert.equal(st.generation, 1);
+  assert.equal(st.opportunityCounters[parentArmId("g1", null)], 2);
+  store.close();
+});
+
+test("batch: one invalid item rejects the whole batch before any write", () => {
+  const store = openStore();
+  const bad = dispatchInput({ itemIndex: 1, envelope: { version: 1, goalId: "g1", candidates: [] } });
+  assert.throws(() => store.prepareSubagentDispatchBatch([dispatchInput({}), bad]), RangeError);
+  assert.equal(countTraces(store), 0);
+  assert.equal(learningState(store).generation, 0);
+  store.close();
+});
+
+test("dispatch input guard: itemIndex must be a nonnegative safe integer", () => {
+  const store = openStore();
+  for (const bad of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1, "0"]) {
+    assert.throws(() => store.prepareSubagentDispatch(dispatchInput({ itemIndex: bad })), RangeError);
+  }
+  assert.equal(countTraces(store), 0);
+  store.close();
+});
+
+test("counter overflow rejects and rolls back", () => {
+  const store = openStore();
+  const dArm = directionArmId("g1", null, "d1");
+  mutateState(store, (s) => { s.opportunityCounters[dArm] = Number.MAX_SAFE_INTEGER; });
+  assert.throws(() => store.prepareSubagentDispatch(dispatchInput({})), /safe integer/);
+  const st = learningState(store);
+  assert.equal(st.generation, 0);
+  assert.equal(st.opportunityCounters[parentArmId("g1", null)], undefined);
+  assert.equal(countTraces(store), 0);
+  // the connection must be usable again (transaction was rolled back, not left open)
+  mutateState(store, (s) => { delete s.opportunityCounters[dArm]; });
+  assert.equal(store.prepareSubagentDispatch(dispatchInput({})).reason, "selected");
+  store.close();
+});

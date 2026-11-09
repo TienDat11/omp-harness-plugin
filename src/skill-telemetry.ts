@@ -52,6 +52,165 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
     return { generation: row.generation, payload: payload as Record<string, unknown> & { generation: number } };
   }
 
+  /** Single place for the dispatch memory trace values; Task 8 replaces the placeholder with rendered memory. */
+  private dispatchMemorySnapshot(_state: LearningStateJSON): { memoryRevision: string; memoryText: string } {
+    return { memoryRevision: "none", memoryText: "" };
+  }
+
+  /** No-op until the pending-projection drain lands; always called under the writer lock. */
+  drainPending(): void {}
+
+  private runWriterTransaction<R>(fn: () => R): R {
+    let started = false;
+    try {
+      this.db.exec("BEGIN IMMEDIATE");
+      started = true;
+      const result = fn();
+      this.db.exec("COMMIT");
+      started = false;
+      return result;
+    } finally {
+      if (started) {
+        try { this.db.exec("ROLLBACK"); } catch { /* connection already rolled back */ }
+      }
+    }
+  }
+
+  private hydrateLearningState(): LearningStateJSON {
+    const { payload } = this.readLearningStateRow();
+    const isRecord = (v: unknown): boolean => typeof v === "object" && v !== null && !Array.isArray(v);
+    if (!isRecord(payload.arms) || !isRecord(payload.opportunityCounters) || !isRecord(payload.cooldowns)) {
+      throw new Error("learning_state corrupt");
+    }
+    const state = payload as unknown as LearningStateJSON;
+    for (const v of Object.values(state.opportunityCounters)) {
+      if (!Number.isSafeInteger(v) || v < 0) throw new Error("learning_state corrupt");
+    }
+    for (const a of Object.values(state.arms)) {
+      if (!a || !Number.isSafeInteger(a.n) || !Number.isSafeInteger(a.successes) || a.n < 0 || a.successes < 0 || a.successes > a.n) {
+        throw new Error("learning_state corrupt");
+      }
+    }
+    for (const c of Object.values(state.cooldowns)) {
+      if (!c || !Number.isSafeInteger(c.excludedThroughOpportunity) || !Number.isSafeInteger(c.failures)) {
+        throw new Error("learning_state corrupt");
+      }
+    }
+    return state;
+  }
+
+  private static validateDispatchInput(input: DispatchInput): DispatchInput {
+    if (typeof input !== "object" || input === null) fail("dispatch", "must be an object");
+    for (const key of ["sessionId", "toolCallId", "ticketId", "agent", "inputHash"] as const) {
+      const v = input[key];
+      if (typeof v !== "string" || v.length === 0) fail(key, "must be a nonempty string");
+    }
+    if (!Number.isSafeInteger(input.itemIndex) || input.itemIndex < 0) fail("itemIndex", "must be a nonnegative safe integer");
+    if (!Number.isSafeInteger(input.now)) fail("now", "must be a safe integer");
+    return { ...input, envelope: validateCandidateEnvelope(input.envelope) };
+  }
+
+  private selectSubagentDirection(state: LearningStateJSON, input: DispatchInput, memory: { memoryRevision: string; memoryText: string }): DispatchResult {
+    const own = (rec: object, k: string): boolean => Object.prototype.hasOwnProperty.call(rec, k);
+    const bump = (arm: ArmId): number => {
+      const cur = own(state.opportunityCounters, arm) ? state.opportunityCounters[arm] : 0;
+      if (cur >= Number.MAX_SAFE_INTEGER) throw new RangeError("opportunity counter would exceed safe integer");
+      state.opportunityCounters[arm] = cur + 1;
+      return cur + 1;
+    };
+    const goalId = input.envelope.goalId;
+    const candidates: Candidate[] = input.envelope.candidates.map((c) => ({
+      ...c,
+      parentArmId: parentArmId(goalId, c.parentId),
+      directionArmId: directionArmId(goalId, c.parentId, c.directionId),
+    }));
+    const tOf = new Map<ArmId, number>();
+    for (const c of candidates) if (!tOf.has(c.parentArmId)) tOf.set(c.parentArmId, bump(c.parentArmId));
+    for (const c of candidates) if (!tOf.has(c.directionArmId)) tOf.set(c.directionArmId, bump(c.directionArmId));
+
+    const index = (arm: ArmId): number => {
+      const a = own(state.arms, arm) ? state.arms[arm] : { successes: 0, n: 0 };
+      return klUcbIndex(a.successes, a.n, tOf.get(arm)!);
+    };
+    const eligible: Array<{ c: Candidate; pi: number; di: number }> = [];
+    for (const c of candidates) {
+      const cd = own(state.cooldowns, c.directionArmId) ? state.cooldowns[c.directionArmId] : undefined;
+      const t = tOf.get(c.directionArmId)!;
+      if (cd && t > cd.excludedThroughOpportunity) delete state.cooldowns[c.directionArmId];
+      else if (cd) continue;
+      eligible.push({ c, pi: index(c.parentArmId), di: index(c.directionArmId) });
+    }
+    eligible.sort((x, y) => y.pi - x.pi || y.di - x.di ||
+      (x.c.directionArmId < y.c.directionArmId ? -1 : x.c.directionArmId > y.c.directionArmId ? 1 : 0));
+    const selected = eligible.length > 0 ? eligible[0].c : null;
+    const trace: Trace = {
+      dispatchId: dispatchId(input.sessionId, input.toolCallId, input.itemIndex),
+      sessionId: input.sessionId,
+      toolCallId: input.toolCallId,
+      itemIndex: input.itemIndex,
+      ticketId: input.ticketId,
+      agent: input.agent,
+      goalId,
+      candidates,
+      selectedDirectionArmId: selected ? selected.directionArmId : null,
+      selectedPrompt: selected ? selected.prompt : "",
+      inputHash: input.inputHash,
+      memoryRevision: memory.memoryRevision,
+      memoryText: memory.memoryText,
+      createdAt: input.now,
+      assessmentStatus: selected ? "pending" : "not_dispatched",
+    };
+    return { trace, selected, memoryText: memory.memoryText, reason: selected ? "selected" : "all_excluded" };
+  }
+
+  prepareSubagentDispatch(input: DispatchInput): DispatchResult {
+    return this.prepareSubagentDispatchBatch([input])[0];
+  }
+
+  prepareSubagentDispatchBatch(inputs: DispatchInput[]): DispatchResult[] {
+    if (!Array.isArray(inputs)) fail("inputs", "must be an array");
+    const valid = inputs.map((i) => SkillTelemetryStore.validateDispatchInput(i));
+    if (valid.length === 0) return [];
+    return this.runWriterTransaction(() => {
+      this.drainPending();
+      const row = this.readLearningStateRow();
+      const state = this.hydrateLearningState();
+      const memory = this.dispatchMemorySnapshot(state);
+      const getTrace = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`);
+      const results: DispatchResult[] = [];
+      const fresh = new Set<number>();
+      valid.forEach((input, i) => {
+        const id = dispatchId(input.sessionId, input.toolCallId, input.itemIndex);
+        const existing = getTrace.get(id) as { payload_json: string } | undefined;
+        if (existing) {
+          const trace = JSON.parse(existing.payload_json) as Trace;
+          if (trace.inputHash !== input.inputHash) throw new Error("dispatch conflict");
+          const selected = trace.candidates.find((c) => c.directionArmId === trace.selectedDirectionArmId) ?? null;
+          results.push({ trace, selected, memoryText: trace.memoryText, reason: trace.selectedDirectionArmId === null ? "all_excluded" : "selected" });
+          return;
+        }
+        results.push(this.selectSubagentDirection(state, input, memory));
+        fresh.add(i);
+      });
+      if (fresh.size === 0) return results;
+      if (results.some((r, i) => fresh.has(i) && r.reason === "all_excluded")) {
+        // A blocked tool call dispatches nothing: keep every selection, mark unsent items not_dispatched.
+        results.forEach((r, i) => { if (fresh.has(i)) r.trace.assessmentStatus = "not_dispatched"; });
+      }
+      const insert = this.db.prepare(`INSERT INTO dispatch_traces(dispatch_id, payload_json, created_at) VALUES (?,?,?)`);
+      for (const i of fresh) {
+        const t = results[i].trace;
+        insert.run(t.dispatchId, JSON.stringify(t), t.createdAt);
+      }
+      const nextGeneration = row.generation + 1;
+      state.generation = nextGeneration;
+      const res = this.db.prepare(`UPDATE learning_state SET generation=?, payload_json=? WHERE id=1 AND generation=?`)
+        .run(nextGeneration, JSON.stringify(state), row.generation);
+      if (Number(res.changes) !== 1) throw new Error("learning_state generation conflict");
+      return results;
+    });
+  }
+
   recordRun(run: SkillRunRecord): void {
     this.db.prepare(`INSERT INTO skill_runs(run_id,session_id,turn_index,skill_name,skill_sha256,task_category,model_id,load_mode,holdout,router_score,mutations,tool_calls,tool_errors,verify_ran,verify_passed,hard_reverted,acceptance_pass_rate,manual_rating,reward,recorded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       run.runId, run.sessionId, run.turnIndex, run.skillName, run.skillSha256, run.taskCategory, run.modelId, run.loadMode,
