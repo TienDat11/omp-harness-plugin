@@ -1,8 +1,9 @@
 /**
  * scout.test.ts — the read-only scout agent stays registered, read-only, and probe-gradable.
  *
- * Probe copy lives in tests/fixtures/scout-probe/ for review; the runner reads probes/ (gitignored).
- * To use it: copy scout-explore.probe.jsonl lines into probes/probes.jsonl and
+ * The probe and fixture under tests/fixtures/scout-probe/ are newly written for scout; they are
+ * not a copy of any existing probe. The runner reads probes/ (gitignored), so to run it: append
+ * the single JSON object in scout-explore.probe.json as one line to probes/probes.jsonl and copy
  * tests/fixtures/scout-probe/scout-explore into probes/fixtures/.
  */
 import { test } from "node:test";
@@ -48,7 +49,7 @@ test("dispatching scout is not a mutating task call", () => {
 });
 
 test("the scout-explore probe passes only for the correct file:line", () => {
-  const probe = JSON.parse(readFileSync(path.join(ROOT, "tests", "fixtures", "scout-probe", "scout-explore.probe.jsonl"), "utf8").trim());
+  const probe = JSON.parse(readFileSync(path.join(ROOT, "tests", "fixtures", "scout-probe", "scout-explore.probe.json"), "utf8").trim());
   assert.equal(probe.split, "in");
   const dir = mkdtempSync(path.join(os.tmpdir(), "scout-probe-"));
   try {
