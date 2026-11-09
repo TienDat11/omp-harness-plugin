@@ -2,7 +2,7 @@ import { test } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -971,6 +971,31 @@ test("F8: file write returns false after commit → pending and PROJECTION_PENDI
   assert.equal(storedTrace(reopened, trace.dispatchId).outcome?.status, "flushed");
   const replay = reopened.commitSubagentEvaluationBatch(input);
   assert.deepEqual(replay, { generation: 2, status: "flushed", replay: true });
+  reopened.close();
+});
+
+test("F8: real writeTextFileAtomic returns false (destination is a directory) → PROJECTION_PENDING; reopen flushes exact bytes", () => {
+  const cwd = tempCwd();
+  const store = openStore(undefined, cwd); // no hooks: the default writer binding is the real helper
+  const trace = dispatchAnother(store, "t1", "d1");
+  const input = commitInput(cwd, successAssessment(trace));
+  mkdirSync(outcomePath(cwd), { recursive: true }); // rename onto a directory fails → helper returns false
+  const err = pendingError(() => store.commitSubagentEvaluationBatch(input)) as Error & { code?: string; generation?: number; operationId?: string; cause?: any };
+  assert.equal(err.code, "PROJECTION_PENDING");
+  assert.equal(err.generation, 2);
+  assert.equal(err.operationId, input.operationId);
+  // The drain failed on the boolean, not on a throw: its own error is PROJECTION_PENDING.
+  assert.equal(err.cause?.code, "PROJECTION_PENDING", `drain cause was ${err.cause}`);
+  assert.equal(learningState(store).generation, 2);
+  assert.equal(countObservations(store), 2);
+  assert.equal(storedTrace(store, trace.dispatchId).outcome?.status, "pending");
+  store.close();
+  rmSync(outcomePath(cwd), { recursive: true, force: true });
+  const reopened = openStore(undefined, cwd);
+  reopened.drainPending();
+  assert.equal(readFileSync(outcomePath(cwd), "utf8"), storedTrace(reopened, trace.dispatchId).outcome?.outcomeJson);
+  assert.equal(readFileSync(outcomePath(cwd), "utf8"), input.outcomeJson);
+  assert.equal(storedTrace(reopened, trace.dispatchId).outcome?.status, "flushed");
   reopened.close();
 });
 

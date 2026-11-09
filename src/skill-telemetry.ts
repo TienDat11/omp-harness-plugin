@@ -182,6 +182,9 @@ ORDER BY json_extract(payload_json,'$.outcome.generation') ASC, json_extract(pay
       const owner = items[0];
       if (terminal.length === items.length) {
         // Replay: every trace terminal under this operation with the same assessment payload.
+        // The owner operationHash is covered by the per-trace assessmentHash, destination and
+        // requestHash checks below; the stored outcomeJson is its only remaining input, and
+        // replay always reuses those original bytes, so no operationHash comparison is needed.
         const projection = owner.trace.outcome;
         const same = items.every((it) => it.trace.evaluationOperationId === valid.operationId && it.trace.assessmentHash === it.hash) &&
           projection !== undefined && projection.operationId === valid.operationId &&
