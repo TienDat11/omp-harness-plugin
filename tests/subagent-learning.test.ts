@@ -631,10 +631,15 @@ test("F9: success, failure and conditional lessons with reinforce/contradict/ret
   s = applyEvaluation(s, t, failureEval(t), 12);
   assert.equal(s.memory.lessons[0].contradictionCount, 1);
   s = applyEvaluation(s, t, failureEval(t), 13);
-  assert.equal(s.memory.lessons[0].contradictionCount, 2);
-  s = applyEvaluation(s, t, failureEval(t), 14);
-  assert.equal(s.memory.lessons.length, 0, "retire only, not recreated by the same assessment");
+  assert.equal(s.memory.lessons.length, 0, "contradiction 2 >= reinforce 2 retires in this evaluation, not recreated");
   assert.equal(s.memory.targetCatalog.length, 0);
+  const one = applyEvaluation(applyEvaluation(emptyState(), t, successEval(t)), t, failureEval(t), 12);
+  assert.equal(one.memory.lessons.length, 0, "reinforce 1, contradiction 1 retires immediately");
+  const reborn = applyEvaluation(one, t, successEval(t), 20);
+  assert.equal(reborn.memory.lessons.length, 1);
+  assert.equal(reborn.memory.lessons[0].reinforceCount, 1);
+  assert.equal(reborn.memory.lessons[0].contradictionCount, 0);
+  assert.equal(reborn.memory.lessons[0].firstSeenAt, 20, "new lesson, not resurrected");
 
   const f = applyEvaluation(emptyState(), t, failureEval(t));
   assert.equal(f.memory.lessons[0].kind, "failure_pattern");
@@ -691,6 +696,17 @@ test("F9: render within 8192 UTF-16 including tags, < escaped, valid JSON after 
   assert.equal(JSON.parse(extractBody(fallback)).lessons.length, 0);
   assert.equal(JSON.parse(extractBody(getSubagentPolicyMemory(bigState(), "other"))).lessons.length, 0);
   assert.throws(() => getSubagentPolicyMemory(bigState(), "g1", 100), RangeError);
+});
+
+test("F9: renderer lists only active cooldowns", () => {
+  const s = emptyState();
+  s.opportunityCounters["live" as never] = 5;
+  s.opportunityCounters["dead" as never] = 6;
+  s.cooldowns["live" as never] = { excludedThroughOpportunity: 5, failures: 1 };
+  s.cooldowns["dead" as never] = { excludedThroughOpportunity: 5, failures: 1 };
+  const body = JSON.parse(extractBody(getSubagentPolicyMemory(s, "g1")));
+  assert.deepEqual(body.cooldowns, ["live"]);
+  assert.equal(body.excludedCount, 0);
 });
 
 test("F9: same state renders the same revision and text", () => {

@@ -835,7 +835,7 @@ export function applyEvaluationToState(
 
   let next: Lesson | null;
   if (existing && existing.contradictionCount > 0 && existing.contradictionCount >= existing.reinforceCount) {
-    next = null; // this assessment only retires the lesson
+    next = null; // guard only: a state loaded from disk already in the retired condition
   } else {
     const files = [...new Set([...selected.scope, ...assessment.changedPaths])].sort(lexCmp).slice(0, TARGETS_PER_LESSON);
     const fresh: Lesson = {
@@ -852,7 +852,11 @@ export function applyEvaluationToState(
       next = fresh; // guidance changed: reset as a new lesson
     } else {
       // Opposite outcome: keep the established lesson, count the contradiction.
-      next = { ...existing, targets: existing.targets.map((t) => ({ ...t })), contradictionCount: existing.contradictionCount + 1, lastSeenAt: now };
+      const contradictions = existing.contradictionCount + 1;
+      // Retire in THIS evaluation when contradictions reach reinforcements; never recreate it here.
+      next = contradictions >= existing.reinforceCount
+        ? null
+        : { ...existing, targets: existing.targets.map((t) => ({ ...t })), contradictionCount: contradictions, lastSeenAt: now };
     }
   }
   const all = (next ? [...others, next] : others).sort(newestFirst).slice(0, LESSON_CAP);
@@ -871,7 +875,10 @@ function renderPolicyMemory(state: LearningStateJSON, goalId: string, maxChars: 
     kind: l.kind, appliesWhen: l.appliesWhen, mechanism: l.mechanism, recommendedChange: l.recommendedChange,
     targets: l.targetIndexes.filter((i) => i < catalog.length).map((i) => ({ file: catalog[i].file, change: catalog[i].change })),
   }));
-  const allCooldowns = Object.keys(state.cooldowns).sort(lexCmp);
+  const own = (rec: object, k: string): boolean => Object.prototype.hasOwnProperty.call(rec, k);
+  const allCooldowns = Object.keys(state.cooldowns).filter((arm) =>
+    (own(state.opportunityCounters, arm) ? state.opportunityCounters[arm as ArmId] : 0) <= state.cooldowns[arm as ArmId].excludedThroughOpportunity,
+  ).sort(lexCmp);
   let cooldowns = allCooldowns.slice(0, MEMORY_COOLDOWNS_MAX);
   const build = (): { revision: string; text: string } => {
     const body = serializeMemoryBody({ lessons, cooldowns, excludedCount: allCooldowns.length - cooldowns.length });
@@ -884,7 +891,10 @@ function renderPolicyMemory(state: LearningStateJSON, goalId: string, maxChars: 
   return out;
 }
 
-/** Pure bounded renderer: <= maxChars UTF-16 units including tags and revision; `<` escaped as <. */
+/**
+ * Pure bounded renderer: <= maxChars UTF-16 units including tags and revision; `<` escaped as <.
+ * Cooldowns are not goal-scoped: their keys are opaque arm hashes and the state cannot map them to a goal.
+ */
 export function getSubagentPolicyMemory(state: LearningStateJSON, goalId: string, maxChars: number = DEFAULT_MEMORY_CHARS): string {
   return renderPolicyMemory(state, goalId, maxChars).text;
 }
