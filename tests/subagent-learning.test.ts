@@ -1533,6 +1533,8 @@ test("F11: evaluate -> commit -> next dispatch receives new revision and cooldow
   const failedArm = directionArmId("g1", null, failed);
   const cd = host.state().cooldowns[failedArm];
   assert.ok(cd, "failure committed a cooldown for the failed direction in SQLite");
+  // Spec §6: excludedThroughOpportunity = T + 3. The failure happened at opportunity T = 1, so 4; dispatch 3 (T = 3) is still <= 4.
+  assert.equal(cd.excludedThroughOpportunity, 1 + 3);
 
   const second = await host.dispatchTask("call-2");
   assert.notEqual(second.receivedInput, first.receivedInput);
@@ -1547,6 +1549,7 @@ test("F11: evaluate -> commit -> next dispatch receives new revision and cooldow
   assert.deepEqual(host.state().cooldowns[failedArm], cd, "cooldown persisted across reopen");
   const third = await host.dispatchTask("call-3");
   assert.ok(third.receivedInput.includes(F11_OPEN));
+  assert.equal(third.trace.memoryRevision, second.trace.memoryRevision, "reopened store renders the same persisted revision");
   // Persisted rows dictate: opportunity count is still <= excludedThroughOpportunity, so dir-b again.
   assert.equal(third.selectedDirectionId, other, "persisted cooldown still excludes the failed direction after reopen");
   assert.ok(!third.receivedInput.includes(`prompt for ${failed}`));
