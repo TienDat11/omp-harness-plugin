@@ -85,7 +85,7 @@ Describes only what runs in `src/skill-telemetry.ts`, `src/superagent.ts` and `s
 - Cooldown: a non-improving failure sets `excludedThroughOpportunity = T + 3`; the next three opportunities are excluded and the fourth is eligible. Duplicate, SKIP and restart do not renew it. It applies to the direction only.
 - Failure cards: cap 50 (evict smallest `lastSeenAt`, then smallest `failureKey`); eviction never removes an active cooldown.
 - Lessons: cap 6; at most 8 targets per lesson; target catalog 8 files.
-- Memory render: default cap 8192 UTF-16 units including tags and revision (minimum 256); at most 8 cooldown direction IDs listed, the rest counted in `excludedCount`; `<` is escaped as `<`.
+- Memory render: default cap 8192 UTF-16 units including tags and revision (minimum 256); at most 8 cooldown direction IDs listed, the rest counted in `excludedCount`; `<` is escaped as the six-character sequence `\u003c` (backslash, u, 0, 0, 3, c).
 - Durability: the guarantee is process-crash and reopen only (temp-write plus rename, existing SQLite settings). There is NO power-loss or fsync durability claim. File IO happens under the SQLite writer lock, so a disk error can block learning-enabled dispatch and commit until resolved.
 - Security: the path and symlink checks do not defend against an OS-level adversary swapping a symlink between check and write.
 
