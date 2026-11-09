@@ -350,3 +350,143 @@ test("/harness-lesson on sets OMP_HARNESS_LESSON_GATE=1, off sets it to 0", asyn
     else process.env.OMP_HARNESS_LESSON_GATE = prev;
   }
 });
+
+// ---- verify-gate v2 (flag harness.verifyGate.v2) ----
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpDir } from "./_fake-pi.ts";
+import { isDocPath, readVerifyCommands } from "../src/verify-gate.ts";
+
+type StopResult = { continue?: boolean; additionalContext?: string } | undefined;
+
+function projectWith(scripts: Record<string, string> | null): string {
+  const dir = tmpDir();
+  if (scripts) writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "fx", scripts }));
+  return dir;
+}
+
+async function stop(pi: FakePi, ctx: unknown): Promise<StopResult> {
+  return (await fire(pi.handlers, "session_stop", {}, ctx)) as StopResult;
+}
+
+test("v2 off: block message is byte-identical to the legacy message", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: false });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "a.ts" } }, ctx);
+  const result = await stop(pi, ctx);
+  assert.equal(
+    result?.additionalContext,
+    "harness verify-gate: 1 file mutation(s) since the last check run. Run the project's real verification (test/build/lint command or a scripted smoke run) and report what it printed, or state explicitly that no check applies. Once verified, also explain to the user (1) why your design/change is right and (2) which look-alike cases must NOT use this design.",
+  );
+});
+
+test("v2 off: a .md-only edit is still gated", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: false });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
+  assert.equal((await stop(pi, ctx))?.continue, true);
+});
+
+test("v2 on with scripts.test: message names npm test", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test", lint: "eslint ." }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "a.ts" } }, ctx);
+  const msg = (await stop(pi, ctx))?.additionalContext ?? "";
+  assert.match(msg, /npm test/);
+  assert.match(msg, /npm run lint/);
+});
+
+test("v2 on without package.json: generic ask, no invented command", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith(null));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "a.py" } }, ctx);
+  const msg = (await stop(pi, ctx))?.additionalContext ?? "";
+  assert.doesNotMatch(msg, /npm /);
+  assert.match(msg, /real verification/);
+});
+
+test("v2 on: docs-only mutations do not block", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "edit", isError: false, input: { path: "notes.txt" } }, ctx);
+  assert.equal(await stop(pi, ctx), undefined);
+});
+
+test("v2 on: a docs-only edit after a passing check does not block", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "src/a.ts" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "bash", isError: false, input: { command: "node --test" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
+  assert.equal(await stop(pi, ctx), undefined);
+});
+
+test("v2 on: docs plus one code file still blocks", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "src/a.ts" } }, ctx);
+  assert.equal((await stop(pi, ctx))?.continue, true);
+});
+
+test("v2 on: mutation with unknown path is treated as code", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: {} }, ctx);
+  assert.equal((await stop(pi, ctx))?.continue, true);
+});
+
+test("v2 on: third block asks to run the check or declare none applies", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "a.ts" } }, ctx);
+  const first = (await stop(pi, ctx))?.additionalContext ?? "";
+  const second = (await stop(pi, ctx))?.additionalContext ?? "";
+  const third = (await stop(pi, ctx))?.additionalContext ?? "";
+  assert.doesNotMatch(first, /last reminder/);
+  assert.doesNotMatch(second, /last reminder/);
+  assert.match(third, /last reminder/);
+  assert.match(third, /npm test/);
+  assert.match(third, /"No check applies"/);
+  assert.equal(await stop(pi, ctx), undefined);
+});
+
+test("readVerifyCommands and isDocPath helpers", () => {
+  assert.deepEqual(readVerifyCommands(projectWith({ lint: "x", test: "y", build: "z" })), ["npm test", "npm run lint"]);
+  assert.deepEqual(readVerifyCommands(projectWith(null)), []);
+  assert.equal(isDocPath("docs/a.MD"), true);
+  assert.equal(isDocPath("a.ts"), false);
+});
+
+test("v2 flag is read from config.yml harness.verifyGate.v2", async () => {
+  const agentDir = tmpDir();
+  const prev = process.env.PI_CODING_AGENT_DIR;
+  const prevEnv = process.env.OMP_HARNESS_VERIFY_GATE_V2;
+  delete process.env.OMP_HARNESS_VERIFY_GATE_V2;
+  try {
+    for (const [value, expectNpm] of [["true", true], ["false", false]] as const) {
+      writeFileSync(join(agentDir, "config.yml"), `task:\n  eager: preferred\nharness:\n  verifyGate:\n    v2: ${value}  # note\n`);
+      process.env.PI_CODING_AGENT_DIR = agentDir;
+      const pi = fakePi();
+      mount(pi);
+      const ctx = fakeCtx(projectWith({ test: "node --test" }));
+      await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "a.ts" } }, ctx);
+      const msg = (await stop(pi, ctx))?.additionalContext ?? "";
+      assert.equal(/npm test/.test(msg), expectNpm, value);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prev;
+    if (prevEnv !== undefined) process.env.OMP_HARNESS_VERIFY_GATE_V2 = prevEnv;
+  }
+});

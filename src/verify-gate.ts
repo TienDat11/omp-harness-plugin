@@ -9,6 +9,7 @@
  */
 import { logHarnessCode } from "./state.ts";
 import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
@@ -19,6 +20,53 @@ export interface GateDeps {
   maxContinuations?: number;
   /** When set (or OMP_HARNESS_LESSON_GATE=1), session_stop also gates on delivering a design lesson. */
   requireLessonOnStop?: boolean;
+  /** Force verify-gate v2 on/off (tests). Default: env OMP_HARNESS_VERIFY_GATE_V2, then config harness.verifyGate.v2. */
+  v2?: boolean;
+}
+
+const DOC_EXT_RE = /\.(?:md|txt)$/i;
+const VERIFY_SCRIPTS = ["test", "verify", "typecheck", "lint"] as const;
+
+/** True for documentation paths (.md, .txt) that never need a code check. */
+export function isDocPath(p: string): boolean {
+  return DOC_EXT_RE.test(p.trim());
+}
+
+/** Verification commands declared by package.json scripts in `cwd`, in test/verify/typecheck/lint order. */
+export function readVerifyCommands(cwd: string): string[] {
+  try {
+    const file = path.join(cwd, "package.json");
+    if (!existsSync(file)) return [];
+    const scripts = (JSON.parse(readFileSync(file, "utf8")) as { scripts?: Record<string, unknown> }).scripts;
+    if (!scripts || typeof scripts !== "object") return [];
+    const out: string[] = [];
+    for (const name of VERIFY_SCRIPTS) {
+      if (typeof scripts[name] !== "string") continue;
+      out.push(name === "test" ? "npm test" : `npm run ${name}`);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Reads `harness: verifyGate: v2: true` from the omp agent config.yml (maps and scalars only). */
+function configFlagV2(): boolean {
+  try {
+    const dir = process.env.PI_CODING_AGENT_DIR || process.env.OMP_CODING_AGENT_DIR || path.join(os.homedir(), ".omp", "agent");
+    const file = path.join(dir, "config.yml");
+    if (!existsSync(file)) return false;
+    const stack: Array<{ indent: number; key: string }> = [];
+    for (const raw of readFileSync(file, "utf8").split(/\r?\n/)) {
+      const m = /^(\s*)([A-Za-z0-9_.-]+):\s*(.*?)\s*(?:#.*)?$/.exec(raw);
+      if (!m || raw.trim().startsWith("#")) continue;
+      const indent = m[1].length;
+      while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+      stack.push({ indent, key: m[2] });
+      if (m[3] && stack.map((e) => e.key).join(".") === "harness.verifyGate.v2") return /^(?:true|"true"|'true'|on)$/i.test(m[3]);
+    }
+  } catch {}
+  return false;
 }
 
 const VERIFY_RE =
@@ -40,10 +88,14 @@ export interface GateState {
   mutatedFiles: string[];
   lessonDelivered: boolean;
   lessonPrompted: boolean;
+  /** True once any mutation could touch a non-documentation file (or its paths are unknown). */
+  nonDocMutation: boolean;
+  /** package.json verification commands, read once per session (null until read). */
+  verifyCommands: string[] | null;
 }
 
 export function createGateState(): GateState {
-  return { mutations: 0, verifications: 0, prompts: 0, lastCheckPassed: null, lastCheckError: null, mutatedFiles: [], lessonDelivered: false, lessonPrompted: false };
+  return { mutations: 0, verifications: 0, prompts: 0, lastCheckPassed: null, lastCheckError: null, mutatedFiles: [], lessonDelivered: false, lessonPrompted: false, nonDocMutation: false, verifyCommands: null };
 }
 
 export function recordMutation(state: GateState): void {
@@ -56,6 +108,8 @@ export function recordVerification(state: GateState, isError = false): void {
   // not mark the mutations as verified, so the gate keeps nagging.
   if (!isError) {
     state.verifications = state.mutations;
+    // v2: only non-doc mutations made after this passing check count again.
+    state.nonDocMutation = false;
   }
   state.lastCheckPassed = !isError;
   state.lastCheckError = Boolean(isError);
@@ -185,6 +239,12 @@ export default function verifyGate(pi: ExtensionAPI, deps: GateDeps = {}): void 
           if (p) paths.push(p);
         }
       }
+      if (paths.length === 0 || paths.some((p) => !isDocPath(p))) state.nonDocMutation = true;
+      if (typeof input?.input === "string") {
+        for (const m of input.input.matchAll(/[\w./\-]+\.([A-Za-z0-9]{1,6})/g)) {
+          if (!isDocPath(m[0])) state.nonDocMutation = true;
+        }
+      }
       for (const p of paths) {
         if (!state.mutatedFiles.includes(p) && state.mutatedFiles.length < 12) state.mutatedFiles.push(p);
       }
@@ -201,7 +261,10 @@ export default function verifyGate(pi: ExtensionAPI, deps: GateDeps = {}): void 
           ? isMutatingTaskCall(result.input)
           : mutatingTaskCallIds.delete(result.toolCallId ?? "") ||
             mutatingTaskCallIds.delete("__pending_mutating_task__");
-      if (isMutating) recordMutation(state);
+      if (isMutating) {
+        recordMutation(state);
+        state.nonDocMutation = true;
+      }
     }
   });
 
@@ -228,7 +291,8 @@ export default function verifyGate(pi: ExtensionAPI, deps: GateDeps = {}): void 
       return undefined;
     }
     const state = getState(ctx?.cwd, ctx);
-    if (needsVerification(state)) {
+    const v2 = deps.v2 ?? (process.env.OMP_HARNESS_VERIFY_GATE_V2 === "1" || configFlagV2());
+    if (needsVerification(state) && !(v2 && !state.nonDocMutation)) {
       const max = deps.maxContinuations ?? 3;
       if (state.prompts >= max) {
         logHarnessCode(String(ctx?.cwd ?? "."), `G1 rc=41 tl=stop n=${state.mutations}`);
@@ -240,11 +304,24 @@ export default function verifyGate(pi: ExtensionAPI, deps: GateDeps = {}): void 
       const reasonPrefix = hadError
         ? `harness verify-gate: the last verification command FAILED and ${state.mutations} file mutation(s) remain unverified.`
         : `harness verify-gate: ${state.mutations} file mutation(s) since the last check run.`;
-      return {
-        continue: true,
-        additionalContext:
-          `${reasonPrefix} Run the project's real verification (test/build/lint command or a scripted smoke run) and report what it printed, or state explicitly that no check applies. Once verified, also explain to the user (1) why your design/change is right and (2) which look-alike cases must NOT use this design.`,
-      };
+      const lessonAsk = "Once verified, also explain to the user (1) why your design/change is right and (2) which look-alike cases must NOT use this design.";
+      if (!v2) {
+        return {
+          continue: true,
+          additionalContext:
+            `${reasonPrefix} Run the project's real verification (test/build/lint command or a scripted smoke run) and report what it printed, or state explicitly that no check applies. ${lessonAsk}`,
+        };
+      }
+      state.verifyCommands ??= readVerifyCommands(String(ctx?.cwd ?? process.cwd()));
+      const cmds = state.verifyCommands;
+      const runAsk = cmds.length > 0
+        ? `Run the project's verification command (${cmds.map((c) => `\`${c}\``).join(", ")}) and report what it printed`
+        : "Run the project's real verification (test/build/lint command or a scripted smoke run) and report what it printed";
+      const finalTurn = state.prompts >= max;
+      const ask = finalTurn
+        ? `This is the last reminder before the gate stops. ${runAsk}, or declare explicitly in your reply "No check applies" and give the reason.`
+        : `${runAsk}, or state explicitly that no check applies.`;
+      return { continue: true, additionalContext: `${reasonPrefix} ${ask} ${lessonAsk}` };
     }
     const lessonOptIn = deps.requireLessonOnStop === true || process.env.OMP_HARNESS_LESSON_GATE === "1";
     if (lessonOptIn && state.mutations > 0 && !state.lessonDelivered && !state.lessonPrompted) {
