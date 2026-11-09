@@ -1809,3 +1809,36 @@ test("F10 fix: a new ticket's targetPaths exclude paths that appear only in cand
   assert.equal(ticket.targetPaths.some((p) => p.includes("scope-only")), false);
   assert.equal(ticket.goal.includes(CANDIDATES_OPEN), false);
 });
+
+// ── Task 11 fix round 2 ──
+
+test("F10 fix 2: learning failure on an existing ticket restores its targetPaths", async () => {
+  const host = learningHost();
+  const goalText = "# Goal\nupdate src/kept.ts\n\n";
+  const first = await dispatch(host, "task", taskInput({ context: goalText + envelopeTag("goal-tp", ["first prompt"]) }), "tp-1");
+  assert.ok(first?.input);
+  const before = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!;
+  const beforeTargets = [...before.targetPaths];
+  assert.ok(getSkillTelemetryStore(host.dir));
+  const db = new DatabaseSync(join(host.dir, ".omp", "harness", "skill-telemetry.db"));
+  try {
+    const row = db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string };
+    const st = JSON.parse(row.p);
+    st.cooldowns[directionArmId("goal-tp-cool", null, "dir-0")] = { excludedThroughOpportunity: 100, failures: 1 };
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(st));
+  } finally {
+    db.close();
+  }
+  const failed = await dispatch(
+    host,
+    "task",
+    taskInput({ context: goalText + envelopeTag("goal-tp-cool"), allowedPaths: ["src/failed-only.ts"] }),
+    "tp-2",
+  );
+  assert.equal(failed?.block, true);
+  assert.match(String(failed?.reason), /excluded by cooldown/);
+  const after = snapshotOf(host.dir).tickets.get(before.ticketId)!;
+  assert.deepEqual(after.targetPaths, beforeTargets);
+  assert.equal(after.targetPaths.some((p) => p.includes("failed-only")), false);
+  assert.equal(after.allowedPaths.some((p) => p.includes("failed-only")), false);
+});

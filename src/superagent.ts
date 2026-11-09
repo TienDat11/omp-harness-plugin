@@ -1653,7 +1653,7 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
             )
           : undefined);
       const priorTicket = ticket
-        ? { stage: ticket.stage, updatedAt: ticket.updatedAt, allowedPaths: [...ticket.allowedPaths] }
+        ? { stage: ticket.stage, updatedAt: ticket.updatedAt, allowedPaths: [...ticket.allowedPaths], targetPaths: [...ticket.targetPaths] }
         : undefined;
       if (ticket === undefined) {
         ticket = openTicket(
@@ -1699,6 +1699,7 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
             ticket.stage = priorTicket.stage;
             ticket.updatedAt = priorTicket.updatedAt;
             ticket.allowedPaths = priorTicket.allowedPaths;
+            ticket.targetPaths = priorTicket.targetPaths;
           } else {
             ticket.stage = "blocked";
           }
