@@ -15,6 +15,7 @@ import {
   type Assessment, type Trace, type LearningStateJSON, type CommitBatchInput,
 } from "../src/skill-telemetry.ts";
 import { writeTextFileAtomic } from "../src/state.ts";
+import { createSuperagent } from "../src/superagent.ts";
 import tools from "../src/tools.ts";
 import { fakePi, fakeCtx, type FakeToolDef } from "./_fake-pi.ts";
 
@@ -1454,5 +1455,100 @@ test("legacy harness_record without subagentEvaluations never touches the learni
   const outcome = JSON.parse(readFileSync(join(fx.workDir, "outcome.json"), "utf8"));
   assert.equal(outcome.goal, "legacy");
   assert.deepEqual({ ...(fx.snapshot() as object), outcome: false }, fx.before, "no learning table changed");
+  closeSkillTelemetryStores();
+});
+
+// ---- Task 13 (F11): evaluate -> commit -> next dispatch smoke through the registered hooks ----
+// Only the host is a stub (fakePi + a recorder of the input reaching the host tool boundary);
+// the superagent hooks, harness_record and the SQLite store are production modules.
+const F11_OPEN = "<subagent-policy-memory>";
+
+function f11Envelope(): string {
+  const candidates = ["dir-a", "dir-b"].map((d) => ({
+    parentId: null, directionId: d, mechanism: `m-${d}`, change: `c-${d}`, scope: ["a.ts"], prompt: `prompt for ${d}`,
+  }));
+  return `<subagent-candidates>${JSON.stringify({ version: 1, goalId: "g1", candidates })}</subagent-candidates>`;
+}
+
+function f11Host() {
+  closeSkillTelemetryStores();
+  const cwd = realpathSync(tempCwd());
+  const workDir = join(cwd, ".omp", "work", "2026-11-09", "task");
+  mkdirSync(workDir, { recursive: true });
+  const evidence = join(cwd, "evidence.txt");
+  writeFileSync(evidence, "c1 FAIL\nc2 FAIL\n");
+  const pi = fakePi();
+  createSuperagent(pi as never);
+  tools(pi as never);
+  const ctx = fakeCtx(cwd);
+  const sessionId = subagentSessionKey(cwd, TEST_SESSION)!;
+  const dbFile = join(cwd, ".omp/harness/skill-telemetry.db");
+  const readRows = <R>(fn: (db: DatabaseSync) => R): R => {
+    const db = new DatabaseSync(dbFile);
+    try { return fn(db); } finally { db.close(); }
+  };
+  const fire = async (name: string, event: unknown): Promise<any> => {
+    const list = pi.handlers.get(name) ?? [];
+    assert.ok(list.length > 0, `no handler for ${name}`);
+    return list[0](event, ctx);
+  };
+  return {
+    // Host tool boundary: the input that the hook hands to the `task` tool.
+    async dispatchTask(toolCallId: string) {
+      const original = { agent: "coder", task: `# Goal\nShip\n\n${f11Envelope()}` };
+      const result = await fire("tool_call", { toolName: "task", toolCallId, input: original });
+      assert.ok(result?.input, `dispatch must rewrite input: ${JSON.stringify(result)}`);
+      const receivedInput = JSON.stringify(result.input);
+      // Read the committed row from SQLite, not from any in-memory cache.
+      const trace = readRows((db) => JSON.parse((db.prepare("SELECT payload_json p FROM dispatch_traces WHERE dispatch_id=?")
+        .get(dispatchId(sessionId, toolCallId, 0)) as { p: string }).p)) as Trace;
+      const selected = trace.candidates.find((c) => directionArmId("g1", null, c.directionId) === trace.selectedDirectionArmId);
+      return { receivedInput, trace, selectedDirectionId: selected!.directionId };
+    },
+    async recordFailure(trace: Trace) {
+      const def = pi.tools.get("harness_record") as unknown as {
+        execute: (id: string, p: Record<string, unknown>, s: unknown, u: unknown, c: unknown) => Promise<ToolResult>;
+      };
+      const fx = { workDir, sha: sha256Of(evidence), trace } as unknown as Fixture;
+      const params = learningParams(fx, { reportKind: "failed", candidate: { criterionIds: ["c1", "c2"], passed: [false, false] } });
+      const r = await def.execute("rec-f11", params, undefined, undefined, ctx);
+      assert.equal(r.details.committed, true);
+      return r;
+    },
+    reopen() { closeSkillTelemetryStores(); },
+    state: () => readRows((db) => JSON.parse((db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string }).p)),
+  };
+}
+
+test("F11: evaluate -> commit -> next dispatch receives new revision and cooldown changes selection", async () => {
+  const host = f11Host();
+  const first = await host.dispatchTask("call-1");
+  const failed = first.selectedDirectionId;
+  const other = failed === "dir-a" ? "dir-b" : "dir-a";
+  const armOrder = ["dir-a", "dir-b"].sort((x, y) => (directionArmId("g1", null, x) < directionArmId("g1", null, y) ? -1 : 1));
+  assert.equal(failed, armOrder[0], "cold tie resolves to the lexically smallest direction arm id");
+  assert.ok(first.receivedInput.includes(`prompt for ${failed}`));
+
+  await host.recordFailure(first.trace);
+  const failedArm = directionArmId("g1", null, failed);
+  const cd = host.state().cooldowns[failedArm];
+  assert.ok(cd, "failure committed a cooldown for the failed direction in SQLite");
+
+  const second = await host.dispatchTask("call-2");
+  assert.notEqual(second.receivedInput, first.receivedInput);
+  assert.ok(second.receivedInput.includes(F11_OPEN));
+  assert.notEqual(second.trace.memoryRevision, first.trace.memoryRevision, "next dispatch carries the new revision");
+  assert.equal(second.selectedDirectionId, other, "failed direction is not selected during cooldown");
+  assert.ok(!second.receivedInput.includes(`prompt for ${failed}`));
+  assert.ok(second.receivedInput.includes(`prompt for ${other}`));
+
+  // Close and reopen: the stub re-reads the persisted rows; the cooldown survived unchanged.
+  host.reopen();
+  assert.deepEqual(host.state().cooldowns[failedArm], cd, "cooldown persisted across reopen");
+  const third = await host.dispatchTask("call-3");
+  assert.ok(third.receivedInput.includes(F11_OPEN));
+  // Persisted rows dictate: opportunity count is still <= excludedThroughOpportunity, so dir-b again.
+  assert.equal(third.selectedDirectionId, other, "persisted cooldown still excludes the failed direction after reopen");
+  assert.ok(!third.receivedInput.includes(`prompt for ${failed}`));
   closeSkillTelemetryStores();
 });
