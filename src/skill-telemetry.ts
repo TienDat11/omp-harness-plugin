@@ -19,6 +19,34 @@ export class SkillTelemetryStore {
     this.db.exec(`CREATE TABLE IF NOT EXISTS skill_runs(run_id TEXT PRIMARY KEY, session_id TEXT, turn_index INTEGER, skill_name TEXT, skill_sha256 TEXT, task_category TEXT, model_id TEXT, load_mode TEXT, holdout INTEGER, router_score REAL, mutations INTEGER, tool_calls INTEGER, tool_errors INTEGER, verify_ran INTEGER, verify_passed INTEGER, hard_reverted INTEGER, acceptance_pass_rate REAL, manual_rating REAL, reward REAL, recorded_at TEXT)`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS skill_stats(skill_name TEXT, skill_sha256 TEXT, task_category TEXT, model_id TEXT, treatment_runs INTEGER DEFAULT 0, treatment_reward_sum REAL DEFAULT 0, control_runs INTEGER DEFAULT 0, control_reward_sum REAL DEFAULT 0, explicit_reads INTEGER DEFAULT 0, manual_overrides INTEGER DEFAULT 0, alpha REAL DEFAULT 2.0, beta REAL DEFAULT 2.0, lift REAL DEFAULT 0, last_used_at TEXT, PRIMARY KEY (skill_name, skill_sha256, task_category, model_id))`);
     this.db.exec(`CREATE INDEX IF NOT EXISTS skill_runs_skill ON skill_runs(skill_name)`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS dispatch_traces (
+  dispatch_id TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS observations (
+  observation_id TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL
+)`);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS learning_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  generation INTEGER NOT NULL,
+  payload_json TEXT NOT NULL
+)`);
+    this.db.exec(`INSERT OR IGNORE INTO learning_state(id, generation, payload_json)
+VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{},"cards":[],"memory":{"lessons":[],"targetCatalog":[]}}')`);
+  }
+
+  // Never reseeds: a missing, unparsable or generation-mismatched row is corruption.
+  private readLearningStateRow(): { generation: number; payload: Record<string, unknown> & { generation: number } } {
+    const row = this.db.prepare(`SELECT generation, payload_json FROM learning_state WHERE id=1`).get() as { generation: number; payload_json: string } | undefined;
+    if (!row) throw new Error("learning_state corrupt");
+    let payload: unknown;
+    try { payload = JSON.parse(row.payload_json); } catch { throw new Error("learning_state corrupt"); }
+    if (typeof payload !== "object" || payload === null || (payload as { generation?: unknown }).generation !== row.generation) {
+      throw new Error("learning_state corrupt");
+    }
+    return { generation: row.generation, payload: payload as Record<string, unknown> & { generation: number } };
   }
 
   recordRun(run: SkillRunRecord): void {
