@@ -1535,7 +1535,16 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
    */
   const drainLearningOutbox = (rawCwd: string | undefined, cwd: string): void => {
     try {
-      if (typeof rawCwd !== "string" || !path.isAbsolute(rawCwd)) return;
+      if (typeof rawCwd !== "string" || !path.isAbsolute(rawCwd)) {
+        // "." keeps the cwd value out of the log line (the p= slug derives from it).
+        logHarnessCode(".", "W2 k=39 tl=session_start code=CWD_NOT_ABSOLUTE");
+        return;
+      }
+      // A missing DB has nothing pending; never create the directory or file just to drain.
+      if (!existsSync(path.join(cwd, ".omp", "harness", "skill-telemetry.db"))) {
+        logHarnessCode(rawCwd, "W2 k=39 tl=session_start code=STORE_ABSENT");
+        return;
+      }
       const store = getSkillTelemetryStore(cwd);
       if (store === null) {
         logHarnessCode(rawCwd as string, "W2 k=39 tl=session_start code=STORE_UNAVAILABLE");

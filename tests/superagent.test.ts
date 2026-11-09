@@ -1874,6 +1874,47 @@ test("startup drain runs for parent only and does not throw on failure", async (
   });
 });
 
+test("startup drain fix: absent DB creates nothing and logs STORE_ABSENT", async () => {
+  await withHarnessLog(async (logFile) => {
+    const host = learningHost();
+    await fire(host.pi, "session_start", {}, host.ctx);
+    assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+    assert.match(readFileSync(logFile, "utf8"), /W2 .*k=39 tl=session_start code=STORE_ABSENT/);
+  });
+});
+
+test("startup drain fix: non-absolute cwd logs CWD_NOT_ABSOLUTE without the cwd value", async () => {
+  await withHarnessLog(async (logFile) => {
+    const pi = fakePi();
+    mount(pi);
+    await fire(pi, "session_start", {}, fakeCtx("relative-secret-dir"));
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /k=39 tl=session_start code=CWD_NOT_ABSOLUTE/);
+    assert.equal(log.includes("relative-secret-dir"), false);
+  });
+});
+
+test("startup drain fix: resume path drains once and logs STORE_UNAVAILABLE on a null store", async () => {
+  const host = learningHost();
+  const spy = spyDrain(host.dir);
+  await fire(host.pi, "session_start", { reason: "resume" }, host.ctx);
+  assert.equal(spy.calls(), 1, "resume drains once");
+
+  await withHarnessLog(async (logFile) => {
+    const h2 = learningHost();
+    // A directory at the DB path exists but cannot be opened, so the store is null.
+    mkdirSync(join(h2.dir, ".omp", "harness", "skill-telemetry.db"), { recursive: true });
+    const origError = console.error;
+    console.error = () => {};
+    try {
+      await assert.doesNotReject(async () => { await fire(h2.pi, "session_start", { reason: "resume" }, h2.ctx); });
+    } finally {
+      console.error = origError;
+    }
+    assert.match(readFileSync(logFile, "utf8"), /k=39 tl=session_start code=STORE_UNAVAILABLE/);
+  });
+});
+
 test("legacy dispatch is not blocked by pending outbox and creates no trace", async () => {
   const host = learningHost();
   assert.ok(getSkillTelemetryStore(host.dir));
