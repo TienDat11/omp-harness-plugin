@@ -173,6 +173,8 @@ per-token models:
 | `task`, `coder`, `scout`, `sonic`, `researcher`, `harness-grader`, `seance` | `vilao/claude-haiku-5-5` |
 | `reviewer`, `security-reviewer`, `harness-proposer`, `session-orchestrator`, `architect` | `ns24/deepseek-v4.1-flash:high` |
 
+Route "where is X / how does Y connect" exploration to `scout` (read-only, `read grep glob lsp`, bounded `file:line` summary) instead of reading many files in the main context.
+
 `task.maxRecursionDepth: 1` — a subagent may not spawn its own children.
 
 ### Fallback for a subagent override does NOT use `fallbackChains.task`
