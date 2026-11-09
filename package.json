@@ -23,7 +23,8 @@
     "test": "node --test",
     "verify": "node scripts/verify.mjs",
     "probes": "node scripts/run-probes.mjs",
-    "compare": "node scripts/compare.mjs"
+    "compare": "node scripts/compare.mjs",
+    "mine": "node scripts/mine-sessions.mjs"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "0.7.0",
