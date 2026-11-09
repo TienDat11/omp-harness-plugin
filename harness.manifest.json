@@ -20,21 +20,24 @@
     "src/memory.ts",
     "src/verify-gate.ts",
     "src/stack-router.ts",
-    "src/superagent.ts"
+    "src/superagent.ts",
+    "src/cache-alert.ts"
   ],
   "files": {
+    "src/cache-alert.ts": "79e5578bc2397b19a4a37a35103e0be81b325a3e6fb06df5e248bccc2e3ec8fc",
     "src/decisions.ts": "b50851e47ca58b96aaabb0b30fcb5416778d71f815557c3e53dedd812388ffa4",
     "src/intake.ts": "bacdcc3cb6282a7a2e58a98a0ea9021f2362fe2f50a114121c2276e74d8ca56a",
     "src/memory.ts": "d89fa51463336a37cbc30fd5a61df8df9f87d26683fc42c56d56579adb493e50",
     "src/policy.ts": "63ce931141dc9e06451dbda961c5e4a9e51153d7c79a5cf21571631a55f7ca7b",
     "src/read-budget.ts": "894a48aef12c2f33e77a2792d8a1827e526780b62059e0c679b1e9ff9bdc8b1e",
+    "src/session-metrics.ts": "5108e3e9cf4d5a308eed7cd09808dee883f49dd697f2f274a05fc68a20fb131e",
     "src/skill-specs.ts": "bcf303a34e405d9b70fd356fbe98cefb5483b52c5bfd975af4de734be1537e7c",
     "src/skill-telemetry.ts": "b4b3443095b9cd342de6764aec019a3879cfdf50774834a93089d73968d8c67f",
     "src/stack-router.ts": "cdfd6a8d0d9649ef9d6ac91e72d23025acba211a9ad3e858a8d86f40832536f5",
-    "src/state.ts": "4ed0cf4f91971b4fac1e9f3ff6146c5c6722dd564e2a2df80661c76295dcc580",
+    "src/state.ts": "920f390a12705782cc4b8f084133357f5d0501fe3fc26e2f5b4828cb8cd22d33",
     "src/superagent.ts": "883441633d2cc7c2fc40de2ec980a1850ab99bf3eaa074eead1eea6f4d1ccc45",
     "src/telemetry.ts": "820471b12952ddd671638a6b9eb7c794cfeb41928c2110e53ced62f5f1308001",
-    "src/tools.ts": "b70451f83a240c98f330e694d3c5b6d820234359003551b3455bfdc2d9f33cd1",
+    "src/tools.ts": "9b60276da80f9cbaa5efcfc23276f0ff190ab3e766b5fc5147f24d3be0bf7bbb",
     "src/verify-gate.ts": "a005f1e7d67d44a0d8195367109b5ff79f52669dead6b27170e33639f4089851",
     "src/zeromem.ts": "d7ffebaf0ec4cabd2de67f17895503eb455fe77ba006b630384fd3ea1f6e3135",
     "config/recommended.yml": "59259445eef2ad57b338fb19a2792f9b13515068e7ae01c93735cb87904ecc1e",
@@ -47,7 +50,7 @@
     "skills/product-delivery/SKILL.md": "d85d406556439b3ba029f3a0bb4cfa4044ba1185e1e3cc36692657e69994f3fc",
     "skills/task-intake/SKILL.md": "436f622ef1cbe4674ffbeb9c16ba0eea647d94eb030e915b688874925be64af0",
     "py/zero_mem_bridge.py": "c2fc9fbb9bf738897390136f79fd8b1dad8949faa3229a01478b2bc55842d724",
-    "package.json": "b48ae8771040556f443bbfb4934311679181bd77ef51768f13ceaa384cc39c08"
+    "package.json": "90114777d27ebd0ca87a78245d26f3695770b9d3df3cefb27c72c63e155372c4"
   },
   "migrations": []
 }

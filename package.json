@@ -15,7 +15,8 @@
       "./src/memory.ts",
       "./src/verify-gate.ts",
       "./src/stack-router.ts",
-      "./src/superagent.ts"
+      "./src/superagent.ts",
+      "./src/cache-alert.ts"
     ]
   },
   "files": ["src/", "scripts/", "skills/", "agents/", "config/", "py/", "vendor/", "!vendor/**/__pycache__/", "!vendor/**/*.pyc", "docs/", "harness.manifest.json", "README.md"],
@@ -23,7 +24,8 @@
     "test": "node --test",
     "verify": "node scripts/verify.mjs",
     "probes": "node scripts/run-probes.mjs",
-    "compare": "node scripts/compare.mjs"
+    "compare": "node scripts/compare.mjs",
+    "mine": "node scripts/mine-sessions.mjs"
   },
   "dependencies": {
     "@typesafe-ai/sdk": "0.7.0",
