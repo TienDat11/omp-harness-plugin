@@ -1,5 +1,7 @@
 # Changelog — omp-harness 1.2.0
 
+- Subagent learning (opt-in): `harness_record` takes optional `subagentEvaluations`; the parent commits independent assessments in one SQLite transaction (KL-UCB selection, 50-card cap, 3-opportunity direction cooldown, 6-lesson bounded policy memory rendered as `<subagent-policy-memory>` within 8192 UTF-16 units). A projection write failure after commit raises `PROJECTION_PENDING` and is drained on the next commit, learning dispatch or `session_start`. Guarantee is process-crash/reopen only, no power-loss fsync claim; the spec §11 upgrade measurement has not been run. See `docs/OMP-HARNESS-UPGRADE-CONTRACTS.md` §6.
+
 - Watchdog target extraction now unwraps markdown-decorated paths (backticks, bold, link form, trailing colon) so a markdown `# Target` no longer escapes scope checking; glob tokens are still rejected.
 - Routing scores only user prose: `extractUserPrompt` strips `<critical>`, `<system-reminder>`, `<zero-mem-recall>`, `<parent-read-ledger>`, `<superagent-watchdog>` envelopes and `[IMPORTANT: User invoked the ...]` lines before `classifyTaskCategory` / `scoreSkillDocs`. Explicit `/skill:<name>` and `skill://<name>` invocations are captured and boosted +0.25, outranking MiniSearch recall.
 - Length damping engages only past ~16 matched terms (`Math.max(1, log2(n/8))`) so oversized prompts cannot saturate every skill to 1.00 while ordinary prompts keep the calibrated curve and stay above the pointer floor.
