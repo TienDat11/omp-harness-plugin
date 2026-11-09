@@ -56,7 +56,8 @@ test("the scout-explore probe passes only for the correct file:line", () => {
     cpSync(path.join(ROOT, "tests", "fixtures", "scout-probe", probe.fixture), dir, { recursive: true });
     const run = () => spawnSync(probe.check.command, { cwd: dir, shell: true }).status;
     writeFileSync(path.join(dir, "answer.txt"), "src/cache.mjs:4\n");
-    assert.notEqual(run(), 0);
+    const wrongStatus = run();
+    assert.equal(wrongStatus, 1);
     writeFileSync(path.join(dir, "answer.txt"), "src/retry.mjs:9\n");
     assert.equal(run(), 0);
     assert.match(readFileSync(path.join(dir, "src", "retry.mjs"), "utf8").split("\n")[8], /function retryBudget/);
