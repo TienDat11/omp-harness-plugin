@@ -33,6 +33,10 @@ import {
 } from "../src/superagent.ts";
 import { normalizePathKey } from "../src/state.ts";
 import { fakePi, fakeCtx, tmpDir } from "./_fake-pi.ts";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import tools from "../src/tools.ts";
+import { sessionStateKey, subagentSessionKey } from "../src/skill-telemetry.ts";
 import superagentDefault, { createSuperagent } from "../src/superagent.ts";
 
 const NOW = 1000;
@@ -1315,4 +1319,59 @@ test("AC-06 snapshot persistence round-trip and resume", async () => {
   assert.deepEqual(hyd.degradedCounts, restored!.degradedCounts);
   assert.deepEqual(hyd.escalateAfter, restored!.escalateAfter);
   assert.equal(drainPendingInspections(createSuperagentState()), undefined);
+});
+
+// ── Task 10: shared session identity and legacy harness_record regression ──
+
+test("getState session key and harness_record learning key come from one helper", async () => {
+  const dir = tmpDir();
+  const ctx = fakeCtx(dir);
+  // The persisted snapshot is keyed by getState(ctx).key; the learning key must equal it.
+  const pi = fakePi();
+  mount(pi);
+  await fire(pi, "session_start", {}, ctx);
+  await fire(pi, "tool_call", { toolName: "task", toolCallId: "k1", input: { goal: "key", agent: "coder" } }, ctx);
+  const snapshot = JSON.parse(readFileSync(join(dir, ".omp", "harness", "superagent-state.json"), "utf8")) as { sessions: Record<string, unknown> };
+  const learningKey = subagentSessionKey(ctx.cwd, ctx.sessionManager.getSessionId());
+  assert.equal(learningKey, `${dir}::test-session`);
+  assert.deepEqual(Object.keys(snapshot.sessions), [learningKey]);
+  for (const [cwd, sid] of [[dir, "abc"], [undefined, "abc"], ["rel/dir", "x::y"]] as Array<[string | undefined, string]>) {
+    const c = { cwd, sessionManager: { getSessionId: () => sid } };
+    assert.equal(superagentSessionKey(cwd, c), sessionStateKey(cwd, sid));
+    assert.equal(subagentSessionKey(cwd, sid), superagentSessionKey(cwd, c));
+  }
+  // Without a host session id getState keeps its cwd-only key; learning has no identity.
+  assert.equal(superagentSessionKey(dir, { cwd: dir }), dir);
+  assert.equal(subagentSessionKey(dir, undefined), null);
+  assert.equal(subagentSessionKey(dir, ""), null);
+});
+
+test("legacy harness_record without subagentEvaluations is unchanged", async () => {
+  const dir = tmpDir();
+  const intake = join(dir, ".omp", "work", "2026-11-09", "legacy");
+  mkdirSync(intake, { recursive: true });
+  const pi = fakePi();
+  tools(pi as never);
+  const def = pi.tools.get("harness_record") as unknown as {
+    execute: (id: string, p: Record<string, unknown>, s: unknown, u: unknown, c: unknown) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+  };
+  const params = {
+    dir: intake, tier: "M", goal: "legacy goal",
+    acceptance: [{ id: "A1", joint: "verify", check: "c", pass: true, evidence: "e" }, { id: "A2", joint: "review", check: "c2", pass: false, evidence: "e2" }],
+    models: ["m"], tokens: 7, wall_ms: 9, notes: "n",
+  };
+  const file = join(intake, "outcome.json");
+  for (const ctx of [fakeCtx(dir), { ...fakeCtx(dir), agent: { kind: "sub" } }, undefined]) {
+    const r = await def.execute("rec-1", params, undefined, undefined, ctx);
+    assert.equal(r.content[0].text, `harness_record: ${file}\nacceptance: 2 total, 1 failed`);
+    assert.deepEqual(Object.keys(r.details).sort(), ["failed", "file", "lesson_cue"]);
+    const outcome = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const expectedKeys = ["task", "dir", "tier", "goal", "acceptance", "models", "tokens", "wall_ms", "notes", "sessionTelemetry", "recorded_at"];
+    assert.deepEqual(Object.keys(outcome), expectedKeys.filter((k) => k in outcome));
+    assert.equal(outcome.task, "legacy");
+    assert.equal(outcome.dir, intake);
+    assert.equal(outcome.tokens, 7);
+    assert.equal(outcome.notes, "n");
+  }
+  assert.equal(existsSync(join(dir, ".omp", "harness", "skill-telemetry.db")), false, "legacy path opens no learning store");
 });

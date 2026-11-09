@@ -134,6 +134,15 @@ ORDER BY json_extract(payload_json,'$.outcome.generation') ASC, json_extract(pay
     return { ...trace.outcome };
   }
 
+  /** Read-only trace lookup for boundary validation. Unknown dispatch or foreign session returns null. */
+  findDispatchTrace(dispatchIdValue: string, sessionId: string): Trace | null {
+    const row = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`)
+      .get(dispatchIdValue) as { payload_json: string } | undefined;
+    if (!row) return null;
+    const trace = JSON.parse(row.payload_json) as Trace;
+    return trace.sessionId === sessionId ? trace : null;
+  }
+
   private static validateCommitInput(input: CommitBatchInput): CommitBatchInput {
     if (typeof input !== "object" || input === null) fail("commit", "must be an object");
     for (const key of ["operationId", "sessionId", "requestHash", "destination", "outcomeJson"] as const) {
@@ -762,8 +771,20 @@ export function failureKey(
 export function evaluationOperationId(sessionId: string, dispatchIds: string[]): string {
   return hashId(["evaluation-v1", sessionId, [...dispatchIds].sort()]);
 }
+/**
+ * Spec §9: the one session-key derivation shared by superagent getState and harness_record.
+ * Base is the raw ctx cwd (process.cwd() when absent); a host session id is appended when present.
+ */
+export function sessionStateKey(cwd: string | undefined, sessionId: string | undefined): string {
+  const base = cwd ?? process.cwd();
+  return sessionId ? `${base}::${sessionId}` : base;
+}
+/** Learning session identity: the getState key, or null when the host session id is missing. */
+export function subagentSessionKey(cwd: string | undefined, sessionId: string | undefined): string | null {
+  return sessionId ? sessionStateKey(cwd, sessionId) : null;
+}
 /** Recursively sort object keys so a hash covers content, not key insertion order. */
-function canonicalValue(value: unknown): unknown {
+export function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
   if (typeof value === "object" && value !== null) {
     const rec = value as Record<string, unknown>;

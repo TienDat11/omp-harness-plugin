@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { normalizePathKey, logHarnessCode, writeTextFileAtomic } from "./state.ts";
 import { classifyVerifyCommand, isMutatingTaskCall, READ_ONLY_AGENTS } from "./verify-gate.ts";
+import { sessionStateKey } from "./skill-telemetry.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 
@@ -998,9 +999,7 @@ export function superagentSessionKey(
   cwd: string | undefined,
   ctx?: SuperagentHookContext,
 ): string {
-  const base = cwd ?? process.cwd();
-  const sessionId = ctx?.sessionManager?.getSessionId?.();
-  return sessionId ? `${base}::${sessionId}` : base;
+  return sessionStateKey(cwd, ctx?.sessionManager?.getSessionId?.());
 }
 
 export function serializeSuperagentState(

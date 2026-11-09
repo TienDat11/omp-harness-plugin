@@ -2,7 +2,7 @@ import { test } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,10 +11,12 @@ import {
   normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex, evaluateAssessment,
   applyFailureCooldown, pruneExpiredCooldowns, capCards,
   applyEvaluationToState, getSubagentPolicyMemory,
-  evaluationOperationId, assessmentHash,
+  evaluationOperationId, assessmentHash, subagentSessionKey,
   type Assessment, type Trace, type LearningStateJSON, type CommitBatchInput,
 } from "../src/skill-telemetry.ts";
 import { writeTextFileAtomic } from "../src/state.ts";
+import tools from "../src/tools.ts";
+import { fakePi, fakeCtx, type FakeToolDef } from "./_fake-pi.ts";
 
 function tempCwd(): string { return mkdtempSync(join(tmpdir(), "learn-")); }
 function dbPathFor(cwd: string): string {
@@ -1134,4 +1136,264 @@ test("F6: card cap 50 evicting the new card does not bypass its active cooldown"
   }));
   assert.equal(next.reason, "all_excluded");
   store.close();
+});
+
+// ---- Task 10: harness_record optional assessments (F12 path/evidence/session part) ----
+function mountHarnessRecord(): FakeToolDef {
+  const pi = fakePi();
+  tools(pi as never);
+  const def = pi.tools.get("harness_record");
+  assert.ok(def, "harness_record tool registered");
+  return def!;
+}
+type ToolResult = { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+async function runHarnessRecord(ctx: unknown, params: Record<string, unknown>): Promise<ToolResult> {
+  const def = mountHarnessRecord() as unknown as {
+    execute: (id: string, p: Record<string, unknown>, s: unknown, u: unknown, c: unknown) => Promise<ToolResult>;
+  };
+  return def.execute("rec-1", params, undefined, undefined, ctx);
+}
+function sha256Of(file: string): string { return createHash("sha256").update(readFileSync(file)).digest("hex"); }
+function plain<T>(v: T): T { return JSON.parse(JSON.stringify(v)) as T; }
+function learningSnapshot(cwd: string, workDir: string) {
+  const db = new DatabaseSync(join(cwd, ".omp/harness/skill-telemetry.db"));
+  try {
+    return plain({
+      traces: db.prepare("SELECT dispatch_id, payload_json FROM dispatch_traces ORDER BY dispatch_id").all(),
+      observations: db.prepare("SELECT observation_id, payload_json FROM observations ORDER BY observation_id").all(),
+      state: db.prepare("SELECT generation, payload_json FROM learning_state").all(),
+      outcome: existsSync(join(workDir, "outcome.json")),
+      lesson: existsSync(join(workDir, "lesson.md")),
+      lessons: existsSync(join(cwd, ".omp/harness/lessons.jsonl")),
+    });
+  } finally { db.close(); }
+}
+const TEST_SESSION = "test-session";
+async function harnessRecordFixture() {
+  closeSkillTelemetryStores();
+  const cwd = realpathSync(tempCwd());
+  const workDir = join(cwd, ".omp", "work", "2026-11-09", "task");
+  mkdirSync(workDir, { recursive: true });
+  const ctx = fakeCtx(cwd);
+  const sessionId = subagentSessionKey(cwd, TEST_SESSION)!;
+  const store = getSkillTelemetryStore(cwd)!;
+  assert.ok(store);
+  const trace = store.prepareSubagentDispatch(dispatchInput({
+    sessionId, envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d1")] },
+  })).trace;
+  const evidence = join(cwd, "evidence.txt");
+  writeFileSync(evidence, "c1 PASS\nc2 PASS\n");
+  const fx = { cwd, workDir, ctx, store, trace, sessionId, sha: sha256Of(evidence), before: undefined as unknown, snapshot: () => learningSnapshot(cwd, workDir) };
+  fx.before = fx.snapshot();
+  return fx;
+}
+type Fixture = Awaited<ReturnType<typeof harnessRecordFixture>>;
+function learningAssessment(fx: Fixture, over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...assessment(fx.trace, { reportKind: "ready", candidatePass: [true, true] }),
+    evidenceRefs: [{ path: "evidence.txt", sha256: fx.sha }],
+    changedPaths: ["a.ts"],
+    ...over,
+  };
+}
+function learningParams(fx: Fixture, over: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    dir: fx.workDir, tier: "M", goal: "parent assessed d1",
+    acceptance: [{ id: "A1", joint: "verify", check: "node --test", pass: true, evidence: "ok" }],
+    models: ["m"], tokens: 1, wall_ms: 1,
+    subagentEvaluations: [learningAssessment(fx, over)],
+    ...extra,
+  };
+}
+function legacyParams(dir: string): Record<string, unknown> {
+  return { dir, tier: "M", goal: "legacy", acceptance: [{ id: "A1", joint: "verify", check: "c", pass: false, evidence: "e" }], models: ["m"], tokens: 3, wall_ms: 4 };
+}
+function mutateStateFor(cwd: string, fn: (s: any) => void): void {
+  const db = new DatabaseSync(join(cwd, ".omp/harness/skill-telemetry.db"));
+  try {
+    const s = JSON.parse((db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string }).p);
+    fn(s);
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(s));
+  } finally { db.close(); }
+}
+function storedTraceFor(cwd: string, id: string): Trace {
+  const db = new DatabaseSync(join(cwd, ".omp/harness/skill-telemetry.db"));
+  try { return JSON.parse((db.prepare("SELECT payload_json p FROM dispatch_traces WHERE dispatch_id=?").get(id) as { p: string }).p); } finally { db.close(); }
+}
+
+type Case = { name: string; make: (fx: Fixture) => { ctx: unknown; params: Record<string, unknown> } };
+const F12_CASES: Case[] = [
+  { name: "evidence traversal", make: (fx) => {
+    const name = `outside-${process.pid}-${Math.random().toString(36).slice(2)}.txt`;
+    const outside = join(fx.cwd, "..", name);
+    writeFileSync(outside, "x");
+    return { ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: `../${name}`, sha256: sha256Of(outside) }] }) };
+  } },
+  { name: "evidence absolute path outside workspace", make: (fx) => {
+    const outside = join(tempCwd(), "e.txt");
+    writeFileSync(outside, "x");
+    return { ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: outside, sha256: sha256Of(outside) }] }) };
+  } },
+  { name: "evidence through a junction component (target inside workspace)", make: (fx) => {
+    const real = join(fx.cwd, "real");
+    mkdirSync(real);
+    writeFileSync(join(real, "evidence.txt"), "c1 PASS\nc2 PASS\n");
+    symlinkSync(real, join(fx.cwd, "linked"), "junction");
+    return { ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: "linked/evidence.txt", sha256: fx.sha }] }) };
+  } },
+  { name: "evidence is a directory, not a regular file", make: (fx) => {
+    mkdirSync(join(fx.cwd, "evdir"));
+    return { ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: "evdir", sha256: fx.sha }] }) };
+  } },
+  { name: "evidence hash mismatch", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: "evidence.txt", sha256: "0".repeat(64) }] }) }) },
+  { name: "evidence file missing", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { evidenceRefs: [{ path: "nope.txt", sha256: fx.sha }] }) }) },
+  { name: "foreign session", make: (fx) => ({ ctx: { ...fx.ctx, sessionManager: { getSessionId: () => "other-session" } }, params: learningParams(fx) }) },
+  { name: "changed proposal carried in the assessment", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { goalId: "g1", mechanism: "different", change: "different", scope: ["z.ts"] }) }) },
+  { name: "subagent caller", make: (fx) => ({ ctx: { ...fx.ctx, agent: { kind: "sub" } }, params: learningParams(fx) }) },
+  { name: "missing parent session identity", make: (fx) => ({ ctx: { ...fx.ctx, sessionManager: { getSessionId: () => "" } }, params: learningParams(fx) }) },
+  { name: "no sessionManager", make: (fx) => ({ ctx: { cwd: fx.cwd }, params: learningParams(fx) }) },
+  { name: "reportKind outside the enum", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { reportKind: "success" }) }) },
+  { name: "passed array with a non-boolean", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { candidate: { criterionIds: ["c1", "c2"], passed: ["true", true] } }) }) },
+  { name: "gate flag not boolean", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { followed: 1 }) }) },
+  { name: "availableAt not a safe integer", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { availableAt: 1.5 }) }) },
+  { name: "criterion IDs duplicated", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {
+    baseline: { criterionIds: ["c1", "c1"], passed: [false, false] }, candidate: { criterionIds: ["c1", "c1"], passed: [true, true] } }) }) },
+  { name: "criterion IDs in a different order", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {
+    baseline: { criterionIds: ["c2", "c1"], passed: [false, false] } }) }) },
+  { name: "empty criterion set", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {
+    baseline: { criterionIds: [], passed: [] }, candidate: { criterionIds: [], passed: [] } }) }) },
+  { name: "ready with a failed criterion", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {
+    candidate: { criterionIds: ["c1", "c2"], passed: [true, false] } }) }) },
+  { name: "changedPaths not normalized", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { changedPaths: ["b.ts", "./a.ts"] }) }) },
+  { name: "changedPaths traversal", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { changedPaths: ["../x.ts"] }) }) },
+  { name: "unknown dispatch", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, { dispatchId: "f".repeat(64) }) }) },
+  { name: "duplicate dispatch in one request", make: (fx) => {
+    const p = learningParams(fx);
+    const list = p.subagentEvaluations as unknown[];
+    return { ctx: fx.ctx, params: { ...p, subagentEvaluations: [list[0], list[0]] } };
+  } },
+  { name: "empty assessment list", make: (fx) => ({ ctx: fx.ctx, params: { ...learningParams(fx), subagentEvaluations: [] } }) },
+  { name: "destination dir outside .omp/work (traversal)", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {}, { dir: join(fx.workDir, "..", "..", "..", "..") }) }) },
+  { name: "destination dir outside the workspace", make: (fx) => {
+    const other = join(tempCwd(), ".omp", "work", "x");
+    mkdirSync(other, { recursive: true });
+    return { ctx: fx.ctx, params: learningParams(fx, {}, { dir: other }) };
+  } },
+  { name: "destination dir missing (not created here)", make: (fx) => ({ ctx: fx.ctx, params: learningParams(fx, {}, { dir: join(fx.cwd, ".omp", "work", "missing") }) }) },
+  { name: "destination through a junction component", make: (fx) => {
+    const target = join(fx.cwd, "elsewhere");
+    mkdirSync(target);
+    const link = join(fx.cwd, ".omp", "work", "linked");
+    symlinkSync(target, link, "junction");
+    return { ctx: fx.ctx, params: learningParams(fx, {}, { dir: link }) };
+  } },
+];
+
+test("F12: path, symlink, evidence hash, session and proposal violations reject before any learning write", async () => {
+  for (const c of F12_CASES) {
+    const fx = await harnessRecordFixture();
+    const { ctx, params } = c.make(fx);
+    await assert.rejects(() => runHarnessRecord(ctx, params), (err: Error) => {
+      assert.match(err.message, /^harness_record: subagentEvaluations rejected: /, `${c.name}: ${err.message}`);
+      return true;
+    }, c.name);
+    assert.deepEqual(fx.snapshot(), fx.before, `no learning write: ${c.name}`);
+  }
+  closeSkillTelemetryStores();
+});
+
+test("F12: a missing destination dir is an error and is not created", async () => {
+  const fx = await harnessRecordFixture();
+  const missing = join(fx.cwd, ".omp", "work", "missing");
+  await assert.rejects(() => runHarnessRecord(fx.ctx, learningParams(fx, {}, { dir: missing })), /no such|missing|not exist/i);
+  assert.equal(existsSync(missing), false);
+  closeSkillTelemetryStores();
+});
+
+test("F12: a not-dispatched (all-excluded) trace is rejected before any learning write", async () => {
+  const fx = await harnessRecordFixture();
+  mutateStateFor(fx.cwd, (s) => {
+    s.cooldowns[fx.trace.selectedDirectionArmId!] = { excludedThroughOpportunity: 100, failures: 1 };
+  });
+  const blocked = fx.store.prepareSubagentDispatch(dispatchInput({
+    sessionId: fx.sessionId, toolCallId: "t-blocked", inputHash: "hb",
+    envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d1")] },
+  }));
+  assert.equal(blocked.reason, "all_excluded");
+  const before = fx.snapshot();
+  await assert.rejects(() => runHarnessRecord(fx.ctx, learningParams(fx, { dispatchId: blocked.trace.dispatchId })), /not dispatched/);
+  assert.deepEqual(fx.snapshot(), before);
+  closeSkillTelemetryStores();
+});
+
+test("harness_record learning branch commits once, writes the projection, then the lesson; replay reuses bytes", async () => {
+  const fx = await harnessRecordFixture();
+  const lesson = { why_this_design: "parent-attested evidence", avoid_misconceptions: [{ similar_case: "worker self-score", why_wrong_there: "not independent", right_pattern_instead: "parent assessment" }] };
+  const params = learningParams(fx, {}, { lesson });
+  const r = await runHarnessRecord(fx.ctx, params);
+  const outcomeFile = join(fx.workDir, "outcome.json");
+  const operationId = evaluationOperationId(fx.sessionId, [fx.trace.dispatchId]);
+  const projection = fx.store.findEvaluationProjection(operationId, fx.sessionId);
+  assert.ok(projection);
+  assert.equal(projection!.status, "flushed");
+  assert.equal(projection!.destination, outcomeFile);
+  const bytes = readFileSync(outcomeFile, "utf8");
+  assert.equal(bytes, projection!.outcomeJson);
+  const outcome = JSON.parse(bytes);
+  assert.equal(outcome.goal, "parent assessed d1");
+  assert.equal(typeof outcome.recorded_at, "string");
+  assert.equal(r.details.replay, false);
+  assert.equal(r.details.generation, 2);
+  assert.ok(existsSync(join(fx.workDir, "lesson.md")));
+  const lessonsFile = join(fx.cwd, ".omp/harness/lessons.jsonl");
+  assert.equal(readFileSync(lessonsFile, "utf8").trim().split("\n").length, 1);
+  const stored = storedTraceFor(fx.cwd, fx.trace.dispatchId);
+  assert.equal(stored.assessmentStatus, "applied");
+  assert.equal(stored.evaluationOperationId, operationId);
+  assert.equal(stored.goalId, "g1", "goal comes from the persisted trace");
+
+  // Replay: same canonical params; fresh telemetry/recorded_at would differ, original bytes are reused.
+  const after = fx.snapshot();
+  await new Promise((res) => setTimeout(res, 5));
+  const again = await runHarnessRecord(fx.ctx, params);
+  assert.equal(again.details.replay, true);
+  assert.equal(readFileSync(outcomeFile, "utf8"), bytes, "replay keeps original bytes");
+  assert.deepEqual(fx.snapshot(), after);
+  assert.equal(readFileSync(lessonsFile, "utf8").trim().split("\n").length, 1, "replay does not append a lesson");
+
+  // Same operation, changed request (different lesson text) conflicts before any write.
+  await assert.rejects(() => runHarnessRecord(fx.ctx, learningParams(fx, {}, { lesson: { ...lesson, why_this_design: "changed" } })), /conflict/);
+  assert.deepEqual(fx.snapshot(), after);
+  closeSkillTelemetryStores();
+});
+
+test("harness_record learning branch accepts <cwd>/.omp/work itself as the destination dir", async () => {
+  const fx = await harnessRecordFixture();
+  const workRoot = join(fx.cwd, ".omp", "work");
+  const r = await runHarnessRecord(fx.ctx, learningParams(fx, {}, { dir: workRoot }));
+  assert.equal(r.details.file, join(workRoot, "outcome.json"));
+  assert.ok(existsSync(join(workRoot, "outcome.json")));
+  closeSkillTelemetryStores();
+});
+
+test("harness_record: a lesson write error is reported separately and does not undo learning", async () => {
+  const fx = await harnessRecordFixture();
+  mkdirSync(join(fx.workDir, "lesson.md")); // a directory in the way makes the lesson write fail after the flush
+  const lesson = { why_this_design: "w", avoid_misconceptions: [{ similar_case: "a", why_wrong_there: "b", right_pattern_instead: "c" }] };
+  const r = await runHarnessRecord(fx.ctx, learningParams(fx, {}, { lesson }));
+  assert.equal(typeof r.details.lesson_error, "string");
+  assert.equal(r.details.replay, false);
+  assert.equal(storedTraceFor(fx.cwd, fx.trace.dispatchId).assessmentStatus, "applied");
+  assert.ok(existsSync(join(fx.workDir, "outcome.json")));
+  closeSkillTelemetryStores();
+});
+
+test("legacy harness_record without subagentEvaluations never touches the learning store (even from a subagent)", async () => {
+  const fx = await harnessRecordFixture();
+  const r = await runHarnessRecord({ ...fx.ctx, agent: { kind: "sub" } }, legacyParams(fx.workDir));
+  assert.match(r.content[0].text, /acceptance: 1 total, 1 failed/);
+  const outcome = JSON.parse(readFileSync(join(fx.workDir, "outcome.json"), "utf8"));
+  assert.equal(outcome.goal, "legacy");
+  assert.deepEqual({ ...(fx.snapshot() as object), outcome: false }, fx.before, "no learning table changed");
+  closeSkillTelemetryStores();
 });

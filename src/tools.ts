@@ -1,10 +1,16 @@
 import { mkdir, readFile, writeFile, appendFile, readdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync, type Stats } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { allowDestructive, allowSecret, writeTextFileAtomic } from "./state.ts";
 import { summarizeSessionFile, resolveSessionFile, type SessionTotals } from "./telemetry.ts";
 import { judge, parseReadinessBlock, readiness } from "./decisions.ts";
+import {
+  getSkillTelemetryStore, subagentSessionKey, evaluationOperationId, evaluateAssessment,
+  normalizeScope, canonicalValue, hashId,
+  type Assessment, type CriterionSet, type ReportKind, type CommitBatchResult,
+} from "./skill-telemetry.ts";
 
 type Acceptance = { id: string; joint: string; check: string; pass: boolean; evidence: string; };
 type Outcome = { task: string; dir: string; tier: string; goal: string; acceptance: Acceptance[]; models: string[]; tokens: number; wall_ms: number; notes: string; sessionTelemetry?: SessionTotals; recorded_at: string; };
@@ -159,6 +165,250 @@ async function claimDir(parent: string, base: string): Promise<string | null> {
   return null;
 }
 
+// ---- harness_record learning branch (spec §6, §7, §9): parent-attested subagent assessments ----
+const REPORT_KINDS: readonly ReportKind[] = ["ready", "failed", "blocked", "dropped"];
+const ASSESSMENT_KEYS = [
+  "dispatchId", "reportKind", "followed", "attributable", "allChecksCompleted", "measurementError",
+  "baseline", "candidate", "evidenceRefs", "changedPaths", "availableAt",
+] as const;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+type LearningCtx = {
+  cwd?: string;
+  agent?: { kind?: string };
+  sessionManager?: { getSessionId?: () => string; getSessionFile?: () => string | undefined };
+} | undefined;
+
+function rejectLearning(why: string): never {
+  throw new Error(`harness_record: subagentEvaluations rejected: ${why}`);
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** Exact key set: assessments carry no candidate/goal metadata; those come from the persisted trace. */
+function exactKeys(rec: Record<string, unknown>, keys: readonly string[], field: string): void {
+  for (const k of Object.keys(rec)) if (!keys.includes(k)) rejectLearning(`${field}.${k} is not an assessment field`);
+  for (const k of keys) if (!(k in rec)) rejectLearning(`${field}.${k} is required`);
+}
+
+function parseCriterionSet(raw: unknown, field: string): CriterionSet {
+  if (!isRecord(raw)) rejectLearning(`${field} must be an object`);
+  exactKeys(raw, ["criterionIds", "passed"], field);
+  const { criterionIds, passed } = raw;
+  if (!Array.isArray(criterionIds) || !criterionIds.every((id) => typeof id === "string" && id.length > 0)) {
+    rejectLearning(`${field}.criterionIds must be nonempty strings`);
+  }
+  if (!Array.isArray(passed) || !passed.every((p) => typeof p === "boolean")) rejectLearning(`${field}.passed must be booleans only`);
+  return { criterionIds: [...criterionIds] as string[], passed: [...passed] as boolean[] };
+}
+
+/** Boundary shape and domain check of every assessment (spec §6). Throws before any side effect. */
+export function parseSubagentAssessments(raw: unknown): Assessment[] {
+  if (!Array.isArray(raw) || raw.length === 0) rejectLearning("must be a nonempty array");
+  const out = raw.map((item, i): Assessment => {
+    const f = `subagentEvaluations[${i}]`;
+    if (!isRecord(item)) rejectLearning(`${f} must be an object`);
+    exactKeys(item, ASSESSMENT_KEYS, f);
+    if (typeof item.dispatchId !== "string" || item.dispatchId.length === 0) rejectLearning(`${f}.dispatchId must be a nonempty string`);
+    if (!REPORT_KINDS.includes(item.reportKind as ReportKind)) rejectLearning(`${f}.reportKind must be one of ${REPORT_KINDS.join("/")}`);
+    for (const k of ["followed", "attributable", "allChecksCompleted", "measurementError"] as const) {
+      if (typeof item[k] !== "boolean") rejectLearning(`${f}.${k} must be a boolean`);
+    }
+    const baseline = parseCriterionSet(item.baseline, `${f}.baseline`);
+    const candidate = parseCriterionSet(item.candidate, `${f}.candidate`);
+    const ids = baseline.criterionIds;
+    const n = ids.length;
+    if (n === 0) rejectLearning(`${f}: criterion set must be nonempty`);
+    if (new Set(ids).size !== n) rejectLearning(`${f}: criterion IDs must be unique`);
+    if (candidate.criterionIds.length !== n || candidate.criterionIds.some((id, j) => id !== ids[j])) {
+      rejectLearning(`${f}: baseline and candidate criterion IDs must be identical and in the same order`);
+    }
+    if (baseline.passed.length !== n || candidate.passed.length !== n) rejectLearning(`${f}: passed arrays must have length ${n}`);
+    if (item.reportKind === "ready" && !candidate.passed.every((p) => p)) rejectLearning(`${f}: ready with a failed criterion`);
+    if (!Array.isArray(item.evidenceRefs)) rejectLearning(`${f}.evidenceRefs must be an array`);
+    const evidenceRefs = item.evidenceRefs.map((ref, j) => {
+      const rf = `${f}.evidenceRefs[${j}]`;
+      if (!isRecord(ref)) rejectLearning(`${rf} must be an object`);
+      exactKeys(ref, ["path", "sha256"], rf);
+      if (typeof ref.path !== "string" || ref.path.length === 0 || ref.path.includes("\0")) rejectLearning(`${rf}.path must be a nonempty path`);
+      if (typeof ref.sha256 !== "string" || !SHA256_HEX.test(ref.sha256)) rejectLearning(`${rf}.sha256 must be 64 lowercase hex characters`);
+      return { path: ref.path, sha256: ref.sha256 };
+    });
+    if (!Array.isArray(item.changedPaths) || !item.changedPaths.every((p) => typeof p === "string")) rejectLearning(`${f}.changedPaths must be strings`);
+    let normalized: string[];
+    try { normalized = normalizeScope(item.changedPaths, `${f}.changedPaths`); } catch (err) { rejectLearning((err as Error).message); }
+    const given = item.changedPaths as string[];
+    if (normalized.length !== given.length || normalized.some((p, j) => p !== given[j])) {
+      rejectLearning(`${f}.changedPaths must be normalized (repo-relative, slash, unique, sorted)`);
+    }
+    if (!Number.isSafeInteger(item.availableAt)) rejectLearning(`${f}.availableAt must be a safe integer`);
+    return {
+      dispatchId: item.dispatchId, reportKind: item.reportKind as ReportKind,
+      followed: item.followed as boolean, attributable: item.attributable as boolean,
+      allChecksCompleted: item.allChecksCompleted as boolean, measurementError: item.measurementError as boolean,
+      baseline, candidate, evidenceRefs, changedPaths: [...given], availableAt: item.availableAt as number,
+    };
+  });
+  if (new Set(out.map((a) => a.dispatchId)).size !== out.length) rejectLearning("duplicate dispatchId in one request");
+  return out;
+}
+
+function isInside(root: string, p: string): boolean {
+  const rel = path.relative(root, p);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+/** Every component from root down to target must exist and must not be a symlink or junction. */
+function assertNoLinkComponents(root: string, target: string, what: string): Stats {
+  let cur = root;
+  let st: Stats = lstatSync(root);
+  for (const seg of path.relative(root, target).split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, seg);
+    try { st = lstatSync(cur); } catch { rejectLearning(`${what}: no such path ${cur}`); }
+    if (st.isSymbolicLink()) rejectLearning(`${what}: symlink or junction component ${cur}`);
+  }
+  return st;
+}
+
+/** Workspace = canonical cwd; caller paths map onto it lexically and must stay inside. */
+function workspacePaths(ctx: LearningCtx): { root: string; toRoot: (p: string, what: string) => string } {
+  const cwdLex = path.resolve(ctx?.cwd ?? process.cwd());
+  let root: string;
+  try { root = realpathSync(cwdLex); } catch { rejectLearning(`workspace ${cwdLex} does not exist`); }
+  const toRoot = (p: string, what: string): string => {
+    const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(root, p);
+    if (isInside(root, abs)) return abs;
+    if (isInside(cwdLex, abs)) return path.join(root, path.relative(cwdLex, abs));
+    rejectLearning(`${what} ${p} is outside the workspace ${root}`);
+  };
+  return { root, toRoot };
+}
+
+/** Spec §7 destination: <canonical cwd>/.omp/work[/...]/outcome.json, existing dir, no link components. */
+function resolveLearningDestination(root: string, dir: string): string {
+  const workRoot = path.join(root, ".omp", "work");
+  if (!isInside(workRoot, dir)) rejectLearning(`dir ${dir} must be inside ${workRoot}`);
+  const st = assertNoLinkComponents(root, dir, "dir");
+  if (!st.isDirectory()) rejectLearning(`dir ${dir} is not a directory`);
+  if (path.relative(realpathSync(dir), dir) !== "") rejectLearning(`dir ${dir} does not resolve to itself`);
+  const destination = path.join(dir, "outcome.json");
+  let existing: Stats | undefined;
+  try { existing = lstatSync(destination); } catch { existing = undefined; }
+  if (existing && (existing.isSymbolicLink() || !existing.isFile())) rejectLearning(`destination ${destination} is not a regular file`);
+  return destination;
+}
+
+/** Evidence: regular file inside the workspace (realpath), no link component, SHA-256 of current bytes. */
+function verifyEvidence(root: string, toRoot: (p: string, what: string) => string, assessments: Assessment[]): void {
+  for (const a of assessments) {
+    for (const ref of a.evidenceRefs) {
+      const p = toRoot(ref.path, "evidence");
+      assertNoLinkComponents(root, p, "evidence");
+      const real = realpathSync(p);
+      if (!isInside(root, real)) rejectLearning(`evidence ${ref.path} resolves outside the workspace`);
+      if (!statSync(real).isFile()) rejectLearning(`evidence ${ref.path} is not a regular file`);
+      const digest = createHash("sha256").update(readFileSync(real)).digest("hex");
+      if (digest !== ref.sha256) rejectLearning(`evidence ${ref.path} sha256 does not match its current bytes`);
+    }
+  }
+}
+
+type LearningParams = {
+  dir: string; tier: string; goal: string; acceptance: Acceptance[]; models: string[];
+  tokens: number; wall_ms: number; notes?: string; lesson?: DesignLesson; subagentEvaluations?: unknown;
+};
+
+async function recordSubagentEvaluations(params: LearningParams, rawCtx: unknown) {
+  const ctx = rawCtx as LearningCtx;
+  // Parent-only authorization at execute time (spec §6); memory-hook guards do not replace it.
+  if (ctx?.agent?.kind === "sub") rejectLearning("only the parent coordinator may submit assessments");
+  const sessionId = subagentSessionKey(ctx?.cwd, ctx?.sessionManager?.getSessionId?.());
+  if (sessionId === null) rejectLearning("parent session identity is unavailable");
+  const assessments = parseSubagentAssessments(params.subagentEvaluations);
+
+  const { root, toRoot } = workspacePaths(ctx);
+  const dir = toRoot(params.dir, "dir");
+  const destination = resolveLearningDestination(root, dir);
+  verifyEvidence(root, toRoot, assessments);
+
+  const store = getSkillTelemetryStore(root);
+  if (!store) rejectLearning("learning store unavailable");
+  for (const a of assessments) {
+    const trace = store.findDispatchTrace(a.dispatchId, sessionId);
+    if (!trace) rejectLearning(`unknown dispatch ${a.dispatchId} in this session`);
+    if (trace.selectedDirectionArmId === null || trace.assessmentStatus === "not_dispatched") {
+      rejectLearning(`dispatch ${a.dispatchId} was not dispatched`);
+    }
+    // Candidate and goal come from the persisted trace, never from the caller.
+    try { evaluateAssessment(trace, a); } catch (err) { rejectLearning((err as Error).message); }
+  }
+
+  // Spec §7 step 1: requestHash over canonical caller params, before telemetry/recorded_at exist.
+  const requestHash = hashId(["harness-record-request-v1", canonicalValue({ ...params, dir })]);
+  const dispatchIds = assessments.map((a) => a.dispatchId).sort();
+  const operationId = evaluationOperationId(sessionId, dispatchIds);
+  const prior = store.findEvaluationProjection(operationId, sessionId);
+  if (prior && (prior.requestHash !== requestHash || prior.destination !== destination)) {
+    rejectLearning(`evaluation conflict: operation ${operationId} was recorded with a different request`);
+  }
+  const outcomeJson = prior ? prior.outcomeJson : buildLearningOutcomeJson(params, dir, root, ctx, operationId, dispatchIds);
+
+  const failed = params.acceptance.filter((a) => !a.pass).length;
+  const base = `harness_record: ${destination}\nacceptance: ${params.acceptance.length} total, ${failed} failed`;
+  let result: CommitBatchResult;
+  try {
+    result = store.commitSubagentEvaluationBatch({ operationId, sessionId, requestHash, destination, outcomeJson, assessments, now: Date.now() });
+  } catch (err) {
+    const e = err as Error & { code?: string; generation?: number };
+    if (e.code !== "PROJECTION_PENDING") throw err;
+    // Learning is committed; only the outcome.json projection is pending. Retrying the same request replays.
+    const text = `${base}\nlearning: committed at generation ${e.generation} (operation ${operationId}); outcome projection PENDING: ${e.message}`;
+    return { content: [{ type: "text" as const, text }], details: { file: destination, failed, operationId, generation: e.generation, replay: false, projection: "pending" } };
+  }
+
+  const details: Record<string, unknown> = { file: destination, failed, operationId, generation: result.generation, replay: result.replay, projection: result.status };
+  const learningLine = `learning: ${result.replay ? "replayed" : "applied"} operation ${operationId} at generation ${result.generation}`;
+  let lessonText = "";
+  const lesson = params.lesson;
+  // Lesson artifacts follow a successful first flush only; they are outside the atomic learning guarantee.
+  if (lesson && !result.replay && result.status === "flushed") {
+    const formatted = formatDesignLesson(lesson, { dir, tier: params.tier, goal: params.goal });
+    try {
+      if (writeTextFileAtomic(path.join(dir, "lesson.md"), formatted) !== true) throw new Error("lesson.md write failed");
+      const lessonsFile = path.join(root, ".omp", "harness", "lessons.jsonl");
+      await mkdir(path.dirname(lessonsFile), { recursive: true });
+      await appendFile(lessonsFile, JSON.stringify({ recorded_at: new Date().toISOString(), dir, tier: params.tier, goal: params.goal, files: lesson.files ?? [], why_this_design: lesson.why_this_design, avoid_misconceptions: lesson.avoid_misconceptions, reflection_question: lesson.reflection_question }) + "\n", "utf8");
+      lessonText = formatted;
+    } catch (err) {
+      details.lesson_error = err instanceof Error ? err.message : String(err);
+    }
+  }
+  if (!lesson) details.lesson_cue = "Teach the user (1) why this design is right and (2) which look-alike cases must NOT use this design.";
+  const lessonErrorLine = typeof details.lesson_error === "string" ? `\nlesson: not written (${details.lesson_error}); learning stays committed` : "";
+  const body = `${base}\n${learningLine}${lessonErrorLine}${lessonText ? `\n\n${lessonText}` : ""}`;
+  return { content: [{ type: "text" as const, text: body }], details };
+}
+
+/** Serialized once per new operation; replay reuses the stored bytes instead. */
+function buildLearningOutcomeJson(params: LearningParams, dir: string, root: string, ctx: LearningCtx, operationId: string, dispatchIds: string[]): string {
+  const sessionFile = resolveSessionFile(ctx?.sessionManager?.getSessionFile?.(), root);
+  let tokens = params.tokens;
+  let sessionTelemetry: SessionTotals | undefined;
+  if (sessionFile !== "") {
+    sessionTelemetry = summarizeSessionFile(sessionFile);
+    if (tokens === 0 && sessionTelemetry.combined.totalTokens > 0) tokens = sessionTelemetry.combined.totalTokens;
+  }
+  const attachTelemetry = sessionTelemetry !== undefined && (sessionTelemetry.combined.totalTokens > 0 || sessionTelemetry.toolCalls > 0);
+  const outcome = {
+    task: path.basename(dir), dir, tier: params.tier, goal: params.goal, acceptance: params.acceptance, models: params.models,
+    tokens, wall_ms: params.wall_ms, notes: params.notes ?? "", sessionTelemetry: attachTelemetry ? sessionTelemetry : undefined,
+    subagentEvaluations: { operationId, dispatchIds }, recorded_at: new Date().toISOString(),
+  };
+  return JSON.stringify(outcome, null, 2);
+}
+
 export default function tools(pi: ExtensionAPI) {
   const z = pi.zod;
   const DecisionRecordSchema = z.object({
@@ -204,11 +454,27 @@ export default function tools(pi: ExtensionAPI) {
         files: z.array(z.string()).optional(),
         reflection_question: z.string().optional().describe("Optional 1-2 sentence non-blocking reflection prompt for the user (never a quiz blocker)"),
       }).optional(),
+      subagentEvaluations: z.array(z.object({
+        dispatchId: z.string().describe("dispatchId from the persisted dispatch trace of this session"),
+        reportKind: z.enum(["ready", "failed", "blocked", "dropped"]),
+        followed: z.boolean(),
+        attributable: z.boolean(),
+        allChecksCompleted: z.boolean(),
+        measurementError: z.boolean(),
+        baseline: z.object({ criterionIds: z.array(z.string()), passed: z.array(z.boolean()) }),
+        candidate: z.object({ criterionIds: z.array(z.string()), passed: z.array(z.boolean()) }),
+        evidenceRefs: z.array(z.object({ path: z.string(), sha256: z.string() })),
+        changedPaths: z.array(z.string()),
+        availableAt: z.number(),
+      })).min(1).optional().describe("Parent-coordinator-only assessments of dispatched subagent candidates; when present, outcome.json is written through the learning transaction"),
     }),
     approval: "write",
     loadMode: "deferred",
     strict: true,
     async execute(_id, params, _signal, _onUpdate, ctx) {
+      if ((params as { subagentEvaluations?: unknown }).subagentEvaluations !== undefined) {
+        return recordSubagentEvaluations(params as LearningParams, ctx);
+      }
       const dir = path.resolve(params.dir);
       if (!existsSync(dir)) throw new Error(`harness_record: no such intake dir: ${dir}`);
       const ompWorkSeg = `${path.sep}.omp${path.sep}work${path.sep}`;
