@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { MIN_SHADOW_SAMPLES } from "./skill-specs.ts";
+import { writeTextFileAtomic } from "./state.ts";
 
 export interface SkillRunRecord {
   runId: string; sessionId: string; turnIndex: number; skillName: string;
@@ -14,10 +15,31 @@ export interface SkillRunRecord {
   manualRating: number | null; reward: number | null; recordedAt: string;
 }
 
+/**
+ * TEST-ONLY fault-injection seam for F7/F8 (failure after the first observation, stale CAS,
+ * projection writer returning false, crash after rename). Not exported, not part of
+ * SubagentLearningStore; production callers never pass it.
+ */
+interface LearningStoreTestHooks {
+  afterFirstObservation?: () => void;
+  beforeStateUpdate?: (db: DatabaseSync) => void;
+  writeProjection?: (destination: string, content: string) => boolean;
+  afterProjectionWrite?: () => void;
+}
+
+/** Learning is committed but the outcome projection is still pending in the outbox. */
+function projectionPendingError(operationId: string, generation: number, cause?: unknown): Error {
+  const err = new Error(`PROJECTION_PENDING: learning committed at generation ${generation} for operation ${operationId}; outcome projection not yet written`, cause === undefined ? undefined : { cause });
+  return Object.assign(err, { code: "PROJECTION_PENDING", operationId, generation });
+}
+
 export class SkillTelemetryStore {
   private db: DatabaseSync;
+  private readonly testHooks: LearningStoreTestHooks;
 
-  constructor(dbPath: string) {
+  /** `__testHooks` is a test-only seam; see LearningStoreTestHooks. */
+  constructor(dbPath: string, __testHooks?: LearningStoreTestHooks) {
+    this.testHooks = __testHooks ?? {};
     this.db = new DatabaseSync(dbPath);
     this.db.exec(`CREATE TABLE IF NOT EXISTS skill_runs(run_id TEXT PRIMARY KEY, session_id TEXT, turn_index INTEGER, skill_name TEXT, skill_sha256 TEXT, task_category TEXT, model_id TEXT, load_mode TEXT, holdout INTEGER, router_score REAL, mutations INTEGER, tool_calls INTEGER, tool_errors INTEGER, verify_ran INTEGER, verify_passed INTEGER, hard_reverted INTEGER, acceptance_pass_rate REAL, manual_rating REAL, reward REAL, recorded_at TEXT)`);
     this.db.exec(`CREATE TABLE IF NOT EXISTS skill_stats(skill_name TEXT, skill_sha256 TEXT, task_category TEXT, model_id TEXT, treatment_runs INTEGER DEFAULT 0, treatment_reward_sum REAL DEFAULT 0, control_runs INTEGER DEFAULT 0, control_reward_sum REAL DEFAULT 0, explicit_reads INTEGER DEFAULT 0, manual_overrides INTEGER DEFAULT 0, alpha REAL DEFAULT 2.0, beta REAL DEFAULT 2.0, lift REAL DEFAULT 0, last_used_at TEXT, PRIMARY KEY (skill_name, skill_sha256, task_category, model_id))`);
@@ -58,8 +80,178 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
     return { memoryRevision: revision, memoryText: text };
   }
 
-  /** No-op until the pending-projection drain lands; always called under the writer lock. */
-  drainPending(): void {}
+  /**
+   * Spec §7 step 5 / F8: flush every pending owner projection under the writer lock, ordered
+   * generation asc then operationId. A false write throws PROJECTION_PENDING and rolls back markers.
+   */
+  drainPending(): void {
+    this.runWriterTransaction(() => this.drainPendingWithinTransaction());
+  }
+
+  /** Caller holds BEGIN IMMEDIATE. Any failure throws so the caller's transaction rolls back. */
+  private drainPendingWithinTransaction(): void {
+    const rows = this.db.prepare(`SELECT dispatch_id, payload_json FROM dispatch_traces
+WHERE json_extract(payload_json,'$.outcome.status')='pending'
+ORDER BY json_extract(payload_json,'$.outcome.generation') ASC, json_extract(payload_json,'$.outcome.operationId') ASC`)
+      .all() as Array<{ dispatch_id: string; payload_json: string }>;
+    for (const row of rows) {
+      const trace = JSON.parse(row.payload_json) as Trace;
+      this.flushOutcomeProjection(trace);
+    }
+  }
+
+  /** Write the stored bytes to the stored destination, then mark the owner flushed (same transaction). */
+  private flushOutcomeProjection(owner: Trace): void {
+    const projection = owner.outcome!;
+    const write = this.testHooks.writeProjection ?? writeTextFileAtomic;
+    if (write(projection.destination, projection.outcomeJson) !== true) {
+      throw projectionPendingError(projection.operationId, projection.generation);
+    }
+    this.testHooks.afterProjectionWrite?.();
+    const flushed: Trace = { ...owner, outcome: { ...projection, status: "flushed" } };
+    this.db.prepare(`UPDATE dispatch_traces SET payload_json=? WHERE dispatch_id=?`).run(JSON.stringify(flushed), owner.dispatchId);
+  }
+
+  /** The only learning_state writer: CAS on the generation read at the start of this transaction. */
+  private persistLearningStateWithinTransaction(state: LearningStateJSON, expectedGeneration: number): number {
+    const nextGeneration = expectedGeneration + 1;
+    if (!Number.isSafeInteger(nextGeneration)) throw new RangeError("generation would exceed safe integer");
+    this.testHooks.beforeStateUpdate?.(this.db);
+    const persisted = { ...state, generation: nextGeneration };
+    const res = this.db.prepare(`UPDATE learning_state SET generation=?, payload_json=? WHERE id=1 AND generation=?`)
+      .run(nextGeneration, JSON.stringify(persisted), expectedGeneration);
+    if (Number(res.changes) !== 1) throw new Error("CAS_STALE_GENERATION: learning_state generation changed during the transaction");
+    return nextGeneration;
+  }
+
+  /** Read-only lookup of an operation's original projection (spec §7 step 1). Foreign session returns null. */
+  findEvaluationProjection(operationId: string, sessionId: string): OutcomeProjection | null {
+    const row = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE json_extract(payload_json,'$.outcome.operationId')=? LIMIT 1`)
+      .get(operationId) as { payload_json: string } | undefined;
+    if (!row) return null;
+    const trace = JSON.parse(row.payload_json) as Trace;
+    if (trace.sessionId !== sessionId || !trace.outcome) return null;
+    return { ...trace.outcome };
+  }
+
+  private static validateCommitInput(input: CommitBatchInput): CommitBatchInput {
+    if (typeof input !== "object" || input === null) fail("commit", "must be an object");
+    for (const key of ["operationId", "sessionId", "requestHash", "destination", "outcomeJson"] as const) {
+      const v = input[key];
+      if (typeof v !== "string" || v.length === 0) fail(key, "must be a nonempty string");
+    }
+    if (!Number.isSafeInteger(input.now)) fail("now", "must be a safe integer");
+    if (!Array.isArray(input.assessments) || input.assessments.length === 0) fail("assessments", "must be a nonempty array");
+    const ids = input.assessments.map((a, i) => {
+      if (typeof a !== "object" || a === null || typeof a.dispatchId !== "string" || a.dispatchId.length === 0) {
+        fail(`assessments[${i}].dispatchId`, "must be a nonempty string");
+      }
+      return a.dispatchId;
+    });
+    if (new Set(ids).size !== ids.length) fail("assessments", "duplicate dispatchId in one operation");
+    if (input.operationId !== evaluationOperationId(input.sessionId, ids)) {
+      fail("operationId", "does not match hash(['evaluation-v1', sessionId, sortedDispatchIds])");
+    }
+    return input;
+  }
+
+  /**
+   * Spec §7: one writer transaction drains pending projections, decides replay by operationId,
+   * dispatch identity and assessmentHash, applies a fully pending batch in dispatchId order and
+   * CAS-saves one state generation. The projection is then flushed by drainPending(); a failed
+   * write after COMMIT throws PROJECTION_PENDING and never rolls back committed learning.
+   */
+  commitSubagentEvaluationBatch(input: CommitBatchInput): CommitBatchResult {
+    const valid = SkillTelemetryStore.validateCommitInput(input);
+    const outcome = this.runWriterTransaction((): CommitBatchResult | { committed: number } => {
+      this.drainPendingWithinTransaction();
+      const getTrace = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`);
+      const items = [...valid.assessments]
+        .sort((a, b) => (a.dispatchId < b.dispatchId ? -1 : a.dispatchId > b.dispatchId ? 1 : 0))
+        .map((a) => {
+          const row = getTrace.get(a.dispatchId) as { payload_json: string } | undefined;
+          if (!row) throw new RangeError(`unknown dispatch: ${a.dispatchId}`);
+          const trace = JSON.parse(row.payload_json) as Trace;
+          if (trace.sessionId !== valid.sessionId) throw new RangeError(`foreign session for dispatch ${a.dispatchId}`);
+          if (trace.selectedDirectionArmId === null || trace.assessmentStatus === "not_dispatched") {
+            throw new RangeError(`dispatch ${a.dispatchId} was not dispatched`);
+          }
+          return { assessment: a, trace, hash: assessmentHash(a) };
+        });
+      const terminal = items.filter((it) => it.trace.assessmentStatus === "applied" || it.trace.assessmentStatus === "skipped");
+      const owner = items[0];
+      if (terminal.length === items.length) {
+        // Replay: every trace terminal under this operation with the same assessment payload.
+        const projection = owner.trace.outcome;
+        const same = items.every((it) => it.trace.evaluationOperationId === valid.operationId && it.trace.assessmentHash === it.hash) &&
+          projection !== undefined && projection.operationId === valid.operationId &&
+          projection.requestHash === valid.requestHash && projection.destination === valid.destination;
+        if (!same) throw new Error("evaluation conflict: dispatch already has a different terminal assessment or operation");
+        return { generation: projection!.generation, status: projection!.status, replay: true };
+      }
+      if (terminal.length > 0) throw new Error("evaluation conflict: mixed terminal and pending dispatches in one batch");
+
+      const row = this.readLearningStateRow();
+      let state = this.hydrateLearningState();
+      const own = (rec: object, k: string): boolean => Object.prototype.hasOwnProperty.call(rec, k);
+      const insertObservation = this.db.prepare(`INSERT OR IGNORE INTO observations(observation_id, payload_json) VALUES (?,?)`);
+      let firstObservation = true;
+      const updated: Trace[] = [];
+      for (const { assessment, trace, hash } of items) {
+        const ev = evaluateAssessment(trace, assessment);
+        if (ev.kind !== "skip") {
+          const selected = trace.candidates.find((c) => c.directionArmId === trace.selectedDirectionArmId)!;
+          state = applyEvaluationToState(state, trace, assessment, valid.now);
+          if (ev.kind === "terminal_failure" && ev.delta <= 0) {
+            const arm = selected.directionArmId;
+            const currentT = own(state.opportunityCounters, arm) ? state.opportunityCounters[arm] : 0;
+            const key = failureKey(trace.goalId, selected.parentId, selected.directionId, selected.mechanism, selected.change, selected.scope);
+            state = applyFailureCooldown(state, arm, key, { mechanism: selected.mechanism, change: selected.change, scope: selected.scope }, currentT, valid.now);
+          }
+          const arms = { ...state.arms };
+          for (const obs of ev.rows) {
+            // A pending trace never has rows: an existing row is an invariant violation, not a replay.
+            const res = insertObservation.run(obs.observationId, JSON.stringify(obs));
+            if (Number(res.changes) !== 1) throw new Error(`observation invariant violation: ${obs.observationId} exists for pending dispatch`);
+            const prev = own(arms, obs.armId) ? arms[obs.armId] : { successes: 0, n: 0 };
+            arms[obs.armId] = { successes: prev.successes + obs.value, n: prev.n + 1 };
+            state = { ...state, arms };
+            if (firstObservation) { firstObservation = false; this.testHooks.afterFirstObservation?.(); }
+          }
+        }
+        updated.push({
+          ...trace,
+          assessmentStatus: ev.kind === "skip" ? "skipped" : "applied",
+          assessmentHash: hash,
+          evaluationOperationId: valid.operationId,
+        });
+      }
+      const generation = this.persistLearningStateWithinTransaction(state, row.generation);
+      updated[0] = {
+        ...updated[0],
+        outcome: {
+          operationId: valid.operationId,
+          requestHash: valid.requestHash,
+          operationHash: operationHash(valid.assessments, valid.destination, valid.outcomeJson),
+          destination: valid.destination,
+          outcomeJson: valid.outcomeJson,
+          generation,
+          status: "pending",
+        },
+      };
+      const updateTrace = this.db.prepare(`UPDATE dispatch_traces SET payload_json=? WHERE dispatch_id=?`);
+      for (const t of updated) updateTrace.run(JSON.stringify(t), t.dispatchId);
+      return { committed: generation };
+    });
+    if (!("committed" in outcome)) return outcome;
+    // Learning is committed. The flush is a separate lock acquisition (spec §7 step 5).
+    try {
+      this.drainPending();
+    } catch (err) {
+      throw projectionPendingError(valid.operationId, outcome.committed, err);
+    }
+    return { generation: outcome.committed, status: "flushed", replay: false };
+  }
 
   private runWriterTransaction<R>(fn: () => R): R {
     let started = false;
@@ -174,7 +366,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
     const valid = inputs.map((i) => SkillTelemetryStore.validateDispatchInput(i));
     if (valid.length === 0) return [];
     return this.runWriterTransaction(() => {
-      this.drainPending();
+      this.drainPendingWithinTransaction();
       const row = this.readLearningStateRow();
       const state = this.hydrateLearningState();
       const getTrace = this.db.prepare(`SELECT payload_json FROM dispatch_traces WHERE dispatch_id=?`);
@@ -207,11 +399,7 @@ VALUES (1, 0, '{"generation":0,"arms":{},"opportunityCounters":{},"cooldowns":{}
         const t = out[i].trace;
         insert.run(t.dispatchId, JSON.stringify(t), t.createdAt);
       }
-      const nextGeneration = row.generation + 1;
-      state.generation = nextGeneration;
-      const res = this.db.prepare(`UPDATE learning_state SET generation=?, payload_json=? WHERE id=1 AND generation=?`)
-        .run(nextGeneration, JSON.stringify(state), row.generation);
-      if (Number(res.changes) !== 1) throw new Error("learning_state generation conflict");
+      this.persistLearningStateWithinTransaction(state, row.generation);
       return out;
     });
   }
@@ -566,6 +754,30 @@ export function failureKey(
   mechanism: string, change: string, scope: string[],
 ): string {
   return hashId(["failure-v1", goalId, parentId, directionId, mechanism, change, normalizeScope(scope)]);
+}
+/** Spec §7: operationId = hash(['evaluation-v1', sessionId, sortedDispatchIds]). */
+export function evaluationOperationId(sessionId: string, dispatchIds: string[]): string {
+  return hashId(["evaluation-v1", sessionId, [...dispatchIds].sort()]);
+}
+/** Recursively sort object keys so a hash covers content, not key insertion order. */
+function canonicalValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalValue);
+  if (typeof value === "object" && value !== null) {
+    const rec = value as Record<string, unknown>;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(rec).sort()) if (rec[k] !== undefined) out[k] = canonicalValue(rec[k]);
+    return out;
+  }
+  return value;
+}
+/** Spec §6: hash of the full canonical assessment payload (evidence and time included). */
+export function assessmentHash(assessment: Assessment): string {
+  return hashId(["assessment-v1", canonicalValue(assessment)]);
+}
+/** Spec §7: operationHash = hash of canonical assessments (dispatchId order) + destination + outcomeJson. */
+function operationHash(assessments: Assessment[], destination: string, outcomeJson: string): string {
+  const sorted = [...assessments].sort((a, b) => (a.dispatchId < b.dispatchId ? -1 : a.dispatchId > b.dispatchId ? 1 : 0));
+  return hashId(["operation-v1", sorted.map(canonicalValue), destination, outcomeJson]);
 }
 
 // ---- Validation boundary (pure, no DB) ----

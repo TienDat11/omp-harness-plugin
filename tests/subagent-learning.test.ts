@@ -2,7 +2,7 @@ import { test } from "node:test";
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,8 +11,10 @@ import {
   normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex, evaluateAssessment,
   applyFailureCooldown, pruneExpiredCooldowns, capCards,
   applyEvaluationToState, getSubagentPolicyMemory,
-  type Assessment, type Trace, type LearningStateJSON,
+  evaluationOperationId, assessmentHash,
+  type Assessment, type Trace, type LearningStateJSON, type CommitBatchInput,
 } from "../src/skill-telemetry.ts";
+import { writeTextFileAtomic } from "../src/state.ts";
 
 function tempCwd(): string { return mkdtempSync(join(tmpdir(), "learn-")); }
 function dbPathFor(cwd: string): string {
@@ -212,10 +214,19 @@ test("F2: KL-UCB values and domain checks", () => {
 
 // ---- Task 5: dispatch selection ----
 const storePaths = new Map<SkillTelemetryStore, string>();
-function openStore(): SkillTelemetryStore {
-  const dbPath = dbPathFor(tempCwd());
-  const store = new SkillTelemetryStore(dbPath);
+const storeCwds = new Map<SkillTelemetryStore, string>();
+/** Test-only fault hooks (constructor option `__testHooks`, internal to the store module). */
+type TestHooks = {
+  afterFirstObservation?: () => void;
+  beforeStateUpdate?: (db: DatabaseSync) => void;
+  writeProjection?: (destination: string, content: string) => boolean;
+  afterProjectionWrite?: () => void;
+};
+function openStore(hooks?: TestHooks, cwd: string = tempCwd()): SkillTelemetryStore {
+  const dbPath = dbPathFor(cwd);
+  const store = new (SkillTelemetryStore as any)(dbPath, hooks) as SkillTelemetryStore;
   storePaths.set(store, dbPath);
+  storeCwds.set(store, cwd);
   return store;
 }
 function withRawDb<R>(store: SkillTelemetryStore, fn: (db: DatabaseSync) => R): R {
@@ -437,12 +448,13 @@ test("replay of a blocked batch returns selected null for every item", () => {
 });
 
 // ---- Task 6: assessment gates ----
-function seededWithDispatch(over: { parentId?: string | null } = {}): { store: SkillTelemetryStore; trace: Trace } {
-  const store = openStore();
+function seededWithDispatch(over: { parentId?: string | null } = {}): { store: SkillTelemetryStore; trace: Trace; dir: string; hooks: TestHooks } {
+  const hooks: TestHooks = {};
+  const store = openStore(hooks);
   const parentId = "parentId" in over ? over.parentId! : "p1";
   const env = { version: 1 as const, goalId: "g1", candidates: [spec(parentId, "d1")] };
   const r = store.prepareSubagentDispatch(dispatchInput({ envelope: env }));
-  return { store, trace: r.trace };
+  return { store, trace: r.trace, dir: storeCwds.get(store)!, hooks };
 }
 function assessment(trace: Trace, o: Partial<Assessment> & { candidatePass?: boolean[]; baselinePass?: boolean[] } = {}): Assessment {
   const { candidatePass = [true, true], baselinePass, ...rest } = o;
@@ -725,4 +737,376 @@ test("F9: dispatch trace stores revision and text rendered from fresh state for 
   assert.match(r.trace.memoryText, /successful_pattern/);
   assert.match(r.trace.memoryRevision, /^[0-9a-f]{64}$/);
   assert.ok(r.trace.memoryText.includes(r.trace.memoryRevision));
+});
+
+// ---- Task 9: commit transaction, CAS, replay, outbox and drain (F5, F6 end-to-end, F7, F8) ----
+function expectedOutcomeBytes(operationId: string): string {
+  return `${JSON.stringify({ operationId, verdict: "recorded", notes: "<kept as data>" }, null, 2)}\n`;
+}
+function outcomePath(dir: string): string { return join(dir, ".omp/work/outcome.json"); }
+function commitInput(dir: string, list: Assessment | Assessment[], over: Partial<CommitBatchInput> = {}): CommitBatchInput {
+  const assessments = Array.isArray(list) ? list : [list];
+  const sessionId = over.sessionId ?? "s1";
+  const operationId = evaluationOperationId(sessionId, assessments.map((a) => a.dispatchId));
+  return {
+    operationId, sessionId, requestHash: hashId(["test-request", sessionId, assessments]),
+    destination: outcomePath(dir), outcomeJson: expectedOutcomeBytes(operationId), assessments, now: 5000, ...over,
+  };
+}
+const successAssessment = (t: Trace) => assessment(t, { reportKind: "ready", candidatePass: [true, true] });
+const failureAssessment = (t: Trace) => assessment(t, { reportKind: "failed", candidatePass: [false, false] });
+const skipAssessment = (t: Trace) => assessment(t, { reportKind: "ready", candidatePass: [true, true], followed: false });
+function dispatchAnother(store: SkillTelemetryStore, toolCallId: string, directionId: string): Trace {
+  return store.prepareSubagentDispatch(dispatchInput({
+    toolCallId, inputHash: toolCallId, envelope: { version: 1, goalId: "g1", candidates: [spec("p1", directionId)] },
+  })).trace;
+}
+function storedTrace(store: SkillTelemetryStore, id: string): Trace {
+  return withRawDb(store, (db) => JSON.parse((db.prepare("SELECT payload_json p FROM dispatch_traces WHERE dispatch_id=?").get(id) as { p: string }).p));
+}
+function injectFailureAfterFirstObservation(hooks: TestHooks): void {
+  hooks.afterFirstObservation = () => { throw new Error("injected fault after first observation"); };
+}
+function advanceGenerationBehindTheBack(hooks: TestHooks): void {
+  // Another writer advances the generation between this transaction's read and its CAS UPDATE.
+  hooks.beforeStateUpdate = (db) => {
+    db.exec("UPDATE learning_state SET generation=generation+1, payload_json=json_set(payload_json,'$.generation',generation+1) WHERE id=1");
+  };
+}
+function injectWriteFalseOnce(hooks: TestHooks, log: string[] = []): string[] {
+  let failed = false;
+  hooks.writeProjection = (destination, content) => {
+    log.push(content);
+    if (!failed) { failed = true; return false; }
+    return writeTextFileAtomic(destination, content);
+  };
+  return log;
+}
+function pendingError(fn: () => unknown): Error & { code?: string; generation?: number; operationId?: string } {
+  try { fn(); } catch (err) { return err as Error & { code?: string }; }
+  assert.fail("expected PROJECTION_PENDING");
+}
+
+test("F5: replay of identical operation does not reapply; changed payload conflicts", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const input = commitInput(dir, successAssessment(trace));
+  const a = store.commitSubagentEvaluationBatch(input);
+  assert.deepEqual(a, { generation: 2, status: "flushed", replay: false });
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), input.outcomeJson);
+  const before = learningState(store);
+  const sel = trace.candidates[0];
+  assert.deepEqual(before.arms[sel.parentArmId], { successes: 1, n: 1 });
+  assert.deepEqual(before.arms[sel.directionArmId], { successes: 1, n: 1 });
+  assert.equal(countObservations(store), 2);
+
+  const b = store.commitSubagentEvaluationBatch({ ...input, outcomeJson: "fresh telemetry bytes from a second caller" });
+  assert.deepEqual(b, { generation: a.generation, status: "flushed", replay: true });
+  assert.deepEqual(learningState(store), before);
+  assert.equal(countObservations(store), 2);
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), input.outcomeJson, "replay keeps original bytes");
+
+  assert.throws(() => store.commitSubagentEvaluationBatch({ ...input, requestHash: "changed" }), /conflict/);
+  assert.throws(() => store.commitSubagentEvaluationBatch({ ...input, destination: join(dir, "elsewhere.json") }), /conflict/);
+  assert.throws(() => store.commitSubagentEvaluationBatch({ ...input, assessments: [{ ...input.assessments[0], availableAt: 2 }] }), /conflict/);
+  assert.deepEqual(learningState(store), before);
+
+  const t = storedTrace(store, trace.dispatchId);
+  assert.equal(t.assessmentStatus, "applied");
+  assert.equal(t.assessmentHash, assessmentHash(input.assessments[0]));
+  assert.equal(t.evaluationOperationId, input.operationId);
+  const proj = store.findEvaluationProjection(input.operationId, "s1");
+  assert.ok(proj);
+  assert.equal(proj!.outcomeJson, input.outcomeJson);
+  assert.equal(proj!.status, "flushed");
+  assert.equal(proj!.generation, 2);
+  assert.equal(store.findEvaluationProjection(input.operationId, "s2"), null);
+  assert.equal(store.findEvaluationProjection("nope", "s1"), null);
+  store.close();
+});
+
+test("F5: skipped retry does not upgrade; mixed-terminal and unknown dispatch reject", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const r = store.commitSubagentEvaluationBatch(commitInput(dir, skipAssessment(trace)));
+  assert.equal(r.replay, false);
+  assert.equal(countObservations(store), 0);
+  const skipped = storedTrace(store, trace.dispatchId);
+  assert.equal(skipped.assessmentStatus, "skipped");
+  assert.equal(skipped.assessmentHash, assessmentHash(skipAssessment(trace)));
+  const st = learningState(store);
+  assert.deepEqual([st.arms, st.cooldowns, st.cards, st.memory.lessons], [{}, {}, [], []]);
+  assert.equal(st.generation, 2);
+
+  // SKIP is never upgraded to ready on the same dispatch.
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(trace))), /conflict/);
+  // Mixed terminal + pending rejects the whole batch.
+  const t2 = dispatchAnother(store, "t2", "d2");
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, [skipAssessment(trace), successAssessment(t2)])), /mixed/);
+  assert.equal(storedTrace(store, t2.dispatchId).assessmentStatus, "pending");
+  // Unknown dispatch, not-dispatched trace, foreign session, forged operationId, empty and duplicate batches reject.
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, { ...successAssessment(t2), dispatchId: "nope" })), /unknown dispatch/);
+  const d3 = directionArmId("g1", "p1", "d3");
+  mutateState(store, (s) => { s.cooldowns[d3] = { excludedThroughOpportunity: 100, failures: 1 }; });
+  const t3 = dispatchAnother(store, "t3", "d3");
+  assert.equal(t3.assessmentStatus, "not_dispatched");
+  const afterBlocked = learningState(store);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment({ ...t3, selectedDirectionArmId: d3 } as Trace))), /not dispatched/);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(t2), { sessionId: "s2" })), /session/);
+  assert.throws(() => store.commitSubagentEvaluationBatch({ ...commitInput(dir, successAssessment(t2)), operationId: "forged" }), /operationId/);
+  assert.throws(() => store.commitSubagentEvaluationBatch({ ...commitInput(dir, successAssessment(t2)), assessments: [] }), /assessments/);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, [successAssessment(t2), successAssessment(t2)])), /duplicate/);
+  assert.equal(countObservations(store), 0);
+  assert.deepEqual(learningState(store), afterBlocked);
+  assert.equal(afterBlocked.generation, 4, "only the two later dispatches advanced generation");
+  store.close();
+});
+
+test("F5: an existing observation row for a pending trace is an invariant violation; no partial pair", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const sel = trace.candidates[0];
+  const oid = observationId(trace.dispatchId, "direction", sel.directionArmId);
+  withRawDb(store, (db) => db.prepare("INSERT INTO observations(observation_id, payload_json) VALUES (?, '{}')").run(oid));
+  const before = learningState(store);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(trace))), /invariant/);
+  assert.equal(countObservations(store), 1);
+  assert.deepEqual(learningState(store), before);
+  assert.equal(storedTrace(store, trace.dispatchId).assessmentStatus, "pending");
+  store.close();
+});
+
+test("F5: batch evaluates in dispatchId order, one generation, owner trace holds the projection", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const t2 = dispatchAnother(store, "t2", "d2");
+  const input = commitInput(dir, [successAssessment(t2), failureAssessment(trace)]);
+  const r = store.commitSubagentEvaluationBatch(input);
+  assert.equal(r.generation, 3);
+  assert.equal(countObservations(store), 4);
+  const [ownerId, otherId] = [trace.dispatchId, t2.dispatchId].sort();
+  const owner = storedTrace(store, ownerId);
+  assert.equal(owner.outcome?.operationId, input.operationId);
+  assert.equal(owner.outcome?.status, "flushed");
+  assert.equal(storedTrace(store, otherId).outcome, undefined);
+  assert.equal(storedTrace(store, otherId).evaluationOperationId, input.operationId);
+  const st = learningState(store);
+  assert.deepEqual(st.arms[parentArmId("g1", "p1")], { successes: 1, n: 2 });
+  assert.equal(st.generation, 3);
+  store.close();
+});
+
+test("skip: failed/blocked/dropped with a false gate is SKIP with no rows (pure and through the store)", () => {
+  const gates: Array<Partial<Assessment>> = [
+    { followed: false }, { attributable: false }, { allChecksCompleted: false }, { measurementError: true }, { evidenceRefs: [] },
+  ];
+  const { store, trace, dir } = seededWithDispatch();
+  for (const reportKind of ["failed", "blocked", "dropped"] as const) {
+    for (const g of gates) {
+      const out = evaluateAssessment(trace, assessment(trace, { reportKind, candidatePass: [false, false], ...g }));
+      assert.equal(out.kind, "skip", `${reportKind} ${JSON.stringify(g)}`);
+      assert.equal(out.rows.length, 0);
+    }
+  }
+  store.commitSubagentEvaluationBatch(commitInput(dir, assessment(trace, { reportKind: "failed", candidatePass: [false, false], followed: false })));
+  const st = learningState(store);
+  assert.deepEqual([st.arms, st.cooldowns, st.cards, st.memory.lessons], [{}, {}, [], []]);
+  assert.equal(countObservations(store), 0);
+  store.close();
+});
+
+test("F7: failure after first observation and state update rolls back everything", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  const before = learningState(store);
+  injectFailureAfterFirstObservation(hooks);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(trace))), /injected/);
+  assert.equal(countObservations(store), 0);
+  assert.deepEqual(learningState(store), before);
+  assert.equal(learningState(store).generation, 1);
+  const t = storedTrace(store, trace.dispatchId);
+  assert.equal(t.assessmentStatus, "pending");
+  assert.equal(t.assessmentHash, undefined);
+  assert.equal(t.outcome, undefined);
+  assert.equal(existsSync(outcomePath(dir)), false);
+  // A retry after the fault applies exactly once.
+  delete hooks.afterFirstObservation;
+  const r = store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(trace)));
+  assert.equal(r.generation, 2);
+  assert.equal(countObservations(store), 2);
+  assert.deepEqual(learningState(store).arms[trace.candidates[0].directionArmId], { successes: 1, n: 1 });
+  store.close();
+});
+
+test("F7: stale CAS rolls back observations, markers and state", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  const before = learningState(store);
+  advanceGenerationBehindTheBack(hooks);
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, failureAssessment(trace))), /CAS_STALE_GENERATION/);
+  assert.equal(countObservations(store), 0);
+  assert.deepEqual(learningState(store), before, "the concurrent bump is rolled back with the transaction");
+  assert.equal(storedTrace(store, trace.dispatchId).assessmentStatus, "pending");
+  assert.equal(existsSync(outcomePath(dir)), false);
+  delete hooks.beforeStateUpdate;
+  store.commitSubagentEvaluationBatch(commitInput(dir, failureAssessment(trace)));
+  const st = learningState(store);
+  assert.deepEqual(st.arms[trace.candidates[0].directionArmId], { successes: 0, n: 1 });
+  assert.deepEqual(st.cooldowns[trace.candidates[0].directionArmId], { excludedThroughOpportunity: 4, failures: 1 });
+  store.close();
+});
+
+test("F8: file write returns false after commit → pending and PROJECTION_PENDING; reopen flushes exact bytes", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  injectWriteFalseOnce(hooks);
+  const input = commitInput(dir, successAssessment(trace));
+  const err = pendingError(() => store.commitSubagentEvaluationBatch(input));
+  assert.match(err.message, /PROJECTION_PENDING/);
+  assert.equal(err.code, "PROJECTION_PENDING");
+  assert.equal(err.generation, 2);
+  assert.equal(err.operationId, input.operationId);
+  // Learning is committed; only the projection is pending.
+  assert.equal(countObservations(store), 2);
+  assert.equal(learningState(store).generation, 2);
+  assert.equal(storedTrace(store, trace.dispatchId).outcome?.status, "pending");
+  assert.equal(existsSync(outcomePath(dir)), false);
+  store.close();
+  const reopened = openStore(undefined, dir);
+  reopened.drainPending();
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), expectedOutcomeBytes(input.operationId));
+  assert.equal(storedTrace(reopened, trace.dispatchId).outcome?.status, "flushed");
+  const replay = reopened.commitSubagentEvaluationBatch(input);
+  assert.deepEqual(replay, { generation: 2, status: "flushed", replay: true });
+  reopened.close();
+});
+
+test("F8: crash after rename before marker update replays identical bytes", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  let crashed = false;
+  hooks.afterProjectionWrite = () => { if (!crashed) { crashed = true; throw new Error("crash after rename"); } };
+  const input = commitInput(dir, successAssessment(trace));
+  assert.throws(() => store.commitSubagentEvaluationBatch(input), /PROJECTION_PENDING/);
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), input.outcomeJson, "file renamed before the crash");
+  assert.equal(storedTrace(store, trace.dispatchId).outcome?.status, "pending");
+  store.close();
+  const reopened = openStore(undefined, dir);
+  reopened.drainPending();
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), input.outcomeJson);
+  assert.equal(storedTrace(reopened, trace.dispatchId).outcome?.status, "flushed");
+  reopened.drainPending(); // nothing pending: no-op
+  reopened.close();
+});
+
+test("F8: two commits to the same destination do not stale-overwrite", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  const t2 = dispatchAnother(store, "t2", "d2");
+  const writes = injectWriteFalseOnce(hooks);
+  const op1 = commitInput(dir, successAssessment(trace));
+  assert.throws(() => store.commitSubagentEvaluationBatch(op1), /PROJECTION_PENDING/);
+  const op2 = commitInput(dir, successAssessment(t2));
+  const r = store.commitSubagentEvaluationBatch(op2);
+  assert.equal(r.status, "flushed");
+  assert.deepEqual(writes, [op1.outcomeJson, op1.outcomeJson, op2.outcomeJson], "pending op1 drains before op2 is written");
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), op2.outcomeJson);
+  assert.equal(storedTrace(store, trace.dispatchId).outcome?.status, "flushed");
+  store.drainPending();
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), op2.outcomeJson, "a later drain never rewrites op1");
+  assert.equal(writes.length, 3);
+  store.close();
+});
+
+test("F8: commit drains pending projections before mutation; a failing drain learns nothing new", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  const t2 = dispatchAnother(store, "t2", "d2");
+  let calls = 0;
+  hooks.writeProjection = (d, c) => (++calls <= 2 ? false : writeTextFileAtomic(d, c));
+  const op1 = commitInput(dir, successAssessment(trace));
+  assert.throws(() => store.commitSubagentEvaluationBatch(op1), /PROJECTION_PENDING/);
+  const before = learningState(store);
+  const op2 = commitInput(dir, successAssessment(t2));
+  const err = pendingError(() => store.commitSubagentEvaluationBatch(op2));
+  assert.equal(err.operationId, op1.operationId, "the blocking projection is op1");
+  assert.deepEqual(learningState(store), before, "op2 not learned while op1 cannot flush");
+  assert.equal(storedTrace(store, t2.dispatchId).assessmentStatus, "pending");
+  assert.equal(countObservations(store), 2);
+  // Retrying op1 drains it inside the transaction and replays as flushed.
+  assert.deepEqual(store.commitSubagentEvaluationBatch(op1), { generation: before.generation, status: "flushed", replay: true });
+  assert.equal(readFileSync(outcomePath(dir), "utf8"), op1.outcomeJson);
+  store.close();
+});
+
+test("F8: a pending projection that cannot be written blocks learning dispatch (fail closed)", () => {
+  const { store, trace, dir, hooks } = seededWithDispatch();
+  hooks.writeProjection = () => false;
+  assert.throws(() => store.commitSubagentEvaluationBatch(commitInput(dir, successAssessment(trace))), /PROJECTION_PENDING/);
+  const before = learningState(store);
+  const traces = countTraces(store);
+  assert.throws(() => dispatchAnother(store, "t2", "d2"), /PROJECTION_PENDING/);
+  assert.throws(() => store.drainPending(), /PROJECTION_PENDING/);
+  assert.deepEqual(learningState(store), before);
+  assert.equal(countTraces(store), traces);
+  store.close();
+});
+
+test("F6: non-improving failure through the commit path sets cooldown T+3; next three excluded, fourth eligible", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const dArm = trace.selectedDirectionArmId!;
+  store.commitSubagentEvaluationBatch(commitInput(dir, failureAssessment(trace)));
+  const st = learningState(store);
+  assert.deepEqual(st.cooldowns[dArm], { excludedThroughOpportunity: 4, failures: 1 });
+  assert.equal(st.cards.length, 1);
+  assert.equal(st.cards[0].failureKey, failureKey("g1", "p1", "d1", "m-d1", "c-d1", ["a.ts"]));
+  assert.equal(st.memory.lessons[0].kind, "failure_pattern");
+  const reasons = [1, 2, 3, 4].map((i) => store.prepareSubagentDispatch(dispatchInput({
+    toolCallId: `n${i}`, inputHash: `n${i}`, envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d1")] },
+  })).reason);
+  assert.deepEqual(reasons, ["all_excluded", "all_excluded", "all_excluded", "selected"]);
+  store.close();
+});
+
+test("F6: partial-improvement failure writes no card and no cooldown", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  store.commitSubagentEvaluationBatch(commitInput(dir, assessment(trace, { reportKind: "failed", candidatePass: [true, false] })));
+  const st = learningState(store);
+  assert.deepEqual([st.cards, st.cooldowns], [[], {}]);
+  assert.equal(st.memory.lessons[0].kind, "conditional_guidance");
+  store.close();
+});
+
+test("F6: duplicate, SKIP and restart do not renew the cooldown", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const dArm = trace.selectedDirectionArmId!;
+  const input = commitInput(dir, failureAssessment(trace));
+  store.commitSubagentEvaluationBatch(input);
+  const after = learningState(store);
+  assert.equal(store.commitSubagentEvaluationBatch(input).replay, true);
+  assert.deepEqual(learningState(store), after, "duplicate does not renew");
+  const t2 = dispatchAnother(store, "t2", "d2");
+  store.commitSubagentEvaluationBatch(commitInput(dir, { ...failureAssessment(t2), followed: false }));
+  let st = learningState(store);
+  assert.deepEqual(st.cooldowns[dArm], after.cooldowns[dArm], "SKIP does not renew");
+  assert.equal(st.cooldowns[t2.selectedDirectionArmId!], undefined);
+  assert.deepEqual(st.cards, after.cards);
+  store.close();
+  const reopened = openStore(undefined, dir);
+  assert.equal(reopened.commitSubagentEvaluationBatch(input).replay, true);
+  st = learningState(reopened);
+  assert.deepEqual(st.cooldowns[dArm], after.cooldowns[dArm], "restart does not renew");
+  assert.deepEqual(st.cards, after.cards);
+  reopened.close();
+});
+
+test("F6: card cap 50 evicting the new card does not bypass its active cooldown", () => {
+  const { store, trace, dir } = seededWithDispatch();
+  const dArm = trace.selectedDirectionArmId!;
+  mutateState(store, (s) => {
+    s.cards = Array.from({ length: 50 }, (_, i) => ({
+      failureKey: `k${String(i).padStart(2, "0")}`, directionArmId: `x${i}`, mechanism: "m", change: "c",
+      scope: ["a.ts"], firstSeenAt: 9_000_000, lastSeenAt: 9_000_000,
+    }));
+  });
+  store.commitSubagentEvaluationBatch(commitInput(dir, failureAssessment(trace), { now: 5000 }));
+  const st = learningState(store);
+  assert.equal(st.cards.length, 50);
+  assert.ok(!st.cards.some((c: { directionArmId: string }) => c.directionArmId === dArm), "new card is the eviction victim");
+  assert.deepEqual(st.cooldowns[dArm], { excludedThroughOpportunity: 4, failures: 1 });
+  const next = store.prepareSubagentDispatch(dispatchInput({
+    toolCallId: "n1", inputHash: "n1", envelope: { version: 1, goalId: "g1", candidates: [spec("p1", "d1")] },
+  }));
+  assert.equal(next.reason, "all_excluded");
+  store.close();
 });
