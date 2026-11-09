@@ -741,7 +741,10 @@ export function pruneExpiredCooldowns(state: LearningStateJSON, currentT: number
 /**
  * Record an eligible non-improving terminal failure. Upserts the card by failureKey
  * (firstSeenAt kept, lastSeenAt updated), caps cards, and sets the direction cooldown to
- * currentT + 3 only when no live entry exists; a live entry is never renewed. Pure.
+ * currentT + 3 and increments failures (a live entry is renewed; an expired one restarts at 1).
+ * Every call is a NEW failure: duplicate, replay, SKIP and restart suppression is the CALLER's
+ * responsibility (Task 9 gates calls on dispatch/assessment identity); this reducer never detects
+ * duplicates from its own state. Pure.
  */
 export function applyFailureCooldown(
   state: LearningStateJSON,
@@ -760,8 +763,10 @@ export function applyFailureCooldown(
       }];
   const cooldowns = { ...state.cooldowns };
   const cur = Object.prototype.hasOwnProperty.call(cooldowns, directionArm) ? cooldowns[directionArm] : undefined;
-  if (!cur || cur.excludedThroughOpportunity < currentT) {
-    cooldowns[directionArm] = { excludedThroughOpportunity: currentT + COOLDOWN_OPPORTUNITIES, failures: 1 };
-  }
+  const live = cur !== undefined && !(cur.excludedThroughOpportunity < currentT);
+  cooldowns[directionArm] = {
+    excludedThroughOpportunity: currentT + COOLDOWN_OPPORTUNITIES,
+    failures: live ? cur.failures + 1 : 1,
+  };
   return { ...state, cards: capCards(upserted), cooldowns };
 }

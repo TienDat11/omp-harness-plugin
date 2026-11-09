@@ -536,15 +536,23 @@ test("F6: failure sets cooldown T+3; prune keeps it through T+3 and drops at T+4
   assert.equal(pruneExpiredCooldowns(s, 9).cooldowns.d, undefined);
 });
 
-test("F6: repeat failure within window does not renew cooldown; input not mutated", () => {
+test("F6: second NEW failure for same direction renews entry; input not mutated", () => {
   const s1 = applyFailureCooldown(emptyState(), "d", "k", cardFields, 5, 100);
   const snap = JSON.stringify(s1);
   const s2 = applyFailureCooldown(s1, "d", "k", cardFields, 6, 200);
-  assert.deepEqual(s2.cooldowns.d, { excludedThroughOpportunity: 8, failures: 1 });
+  assert.deepEqual(s2.cooldowns.d, { excludedThroughOpportunity: 9, failures: 2 });
   assert.equal(JSON.stringify(s1), snap);
   assert.equal(s2.cards.length, 1);
   assert.equal(s2.cards[0].firstSeenAt, 100);
   assert.equal(s2.cards[0].lastSeenAt, 200);
+});
+
+test("F6: reducer renews unconditionally when called; duplicate suppression is the caller's job", () => {
+  const s1 = applyFailureCooldown(emptyState(), "d", "k", cardFields, 5, 100);
+  const s2 = applyFailureCooldown(s1, "d", "k", cardFields, 5, 100);
+  assert.deepEqual(s2.cooldowns.d, { excludedThroughOpportunity: 8, failures: 2 });
+  const s3 = applyFailureCooldown(s2, "d", "k", cardFields, 7, 100);
+  assert.deepEqual(s3.cooldowns.d, { excludedThroughOpportunity: 10, failures: 3 });
 });
 
 test("F6: expired cooldown is replaced by a fresh one", () => {
