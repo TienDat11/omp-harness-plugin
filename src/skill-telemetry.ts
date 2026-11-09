@@ -670,3 +670,51 @@ export function klUcbIndex(
   }
   return low;
 }
+
+// ---- Assessment gates (spec §6): pure, no DB access. Rows are inserted by the commit transaction. ----
+export function evaluateAssessment(
+  trace: Pick<Trace, "dispatchId" | "candidates" | "selectedDirectionArmId">,
+  assessment: Assessment,
+): { kind: "terminal_success" | "terminal_failure" | "skip"; delta: number; rows: Observation[] } {
+  if (assessment.dispatchId !== trace.dispatchId) throw new RangeError("assessment dispatchId does not match trace");
+  const dirArm = trace.selectedDirectionArmId;
+  if (dirArm === null) throw new RangeError("trace has no selected direction");
+  const selected = trace.candidates.find((c) => c.directionArmId === dirArm);
+  if (!selected) throw new RangeError("selected direction not in trace candidates");
+  if (!Number.isSafeInteger(assessment.availableAt)) throw new RangeError("availableAt must be a safe integer");
+
+  const { baseline, candidate } = assessment;
+  const ids = baseline.criterionIds;
+  const n = ids.length;
+  if (n === 0) throw new RangeError("criterion set must be nonempty");
+  if (candidate.criterionIds.length !== n || candidate.criterionIds.some((id, i) => id !== ids[i])) {
+    throw new RangeError("criterion IDs must be identical and in the same order");
+  }
+  if (new Set(ids).size !== n || ids.some((id) => typeof id !== "string" || id === "")) {
+    throw new RangeError("criterion IDs must be unique nonempty strings");
+  }
+  if (baseline.passed.length !== n || candidate.passed.length !== n) {
+    throw new RangeError("passed arrays must match criterion IDs length");
+  }
+  const candidateAllPass = candidate.passed.every((p) => p === true);
+  if (assessment.reportKind === "ready" && !candidateAllPass) throw new RangeError("ready with failed criterion");
+
+  const count = (p: boolean[]) => p.reduce((a, b) => a + (b ? 1 : 0), 0);
+  const delta = (count(candidate.passed) - count(baseline.passed)) / n;
+
+  const valid = assessment.allChecksCompleted && !assessment.measurementError && assessment.evidenceRefs.length > 0;
+  if (!(assessment.followed && assessment.attributable && valid && Number.isFinite(delta))) {
+    return { kind: "skip", delta, rows: [] };
+  }
+  const success = assessment.reportKind === "ready";
+  const value: 0 | 1 = success ? 1 : 0;
+  const mk = (target: "parent" | "direction", armId: ArmId): Observation => ({
+    observationId: observationId(trace.dispatchId, target, armId),
+    dispatchId: trace.dispatchId, target, armId, value, availableAt: assessment.availableAt,
+  });
+  return {
+    kind: success ? "terminal_success" : "terminal_failure",
+    delta,
+    rows: [mk("parent", selected.parentArmId), mk("direction", selected.directionArmId)],
+  };
+}

@@ -8,7 +8,8 @@ import { join } from "node:path";
 import {
   SkillTelemetryStore, getSkillTelemetryStore, closeSkillTelemetryStores,
   parentArmId, directionArmId, dispatchId, observationId, failureKey,
-  normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex,
+  normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex, evaluateAssessment,
+  type Assessment, type Trace,
 } from "../src/skill-telemetry.ts";
 
 function tempCwd(): string { return mkdtempSync(join(tmpdir(), "learn-")); }
@@ -431,4 +432,92 @@ test("replay of a blocked batch returns selected null for every item", () => {
   assert.ok(replay.every((r) => r.selected === null && r.reason === "all_excluded"));
   assert.deepEqual(learningState(store), before);
   store.close();
+});
+
+// ---- Task 6: assessment gates ----
+function seededWithDispatch(over: { parentId?: string | null } = {}): { store: SkillTelemetryStore; trace: Trace } {
+  const store = openStore();
+  const parentId = "parentId" in over ? over.parentId! : "p1";
+  const env = { version: 1 as const, goalId: "g1", candidates: [spec(parentId, "d1")] };
+  const r = store.prepareSubagentDispatch(dispatchInput({ envelope: env }));
+  return { store, trace: r.trace };
+}
+function assessment(trace: Trace, o: Partial<Assessment> & { candidatePass?: boolean[]; baselinePass?: boolean[] } = {}): Assessment {
+  const { candidatePass = [true, true], baselinePass, ...rest } = o;
+  const criterionIds = candidatePass.map((_, i) => `c${i + 1}`);
+  return {
+    dispatchId: trace.dispatchId, reportKind: "ready", followed: true, attributable: true,
+    allChecksCompleted: true, measurementError: false,
+    baseline: { criterionIds, passed: baselinePass ?? criterionIds.map(() => false) },
+    candidate: { criterionIds, passed: candidatePass },
+    evidenceRefs: [{ path: "x", sha256: "y" }], changedPaths: [], availableAt: 1, ...rest,
+  };
+}
+
+test("F4: success yields exactly two observations with distinct IDs", () => {
+  const { trace } = seededWithDispatch();
+  const out = evaluateAssessment(trace, assessment(trace, { reportKind: "ready", candidatePass: [true, true] }));
+  assert.equal(out.kind, "terminal_success");
+  assert.equal(out.rows.length, 2);
+  assert.notEqual(out.rows[0].observationId, out.rows[1].observationId);
+  assert.deepEqual(out.rows.map((r) => r.target).sort(), ["direction", "parent"]);
+  assert.ok(out.rows.every((r) => r.value === 1));
+  assert.equal(out.delta, 1);
+});
+
+test("F4: failure yields two zero observations", () => {
+  const { trace } = seededWithDispatch();
+  const out = evaluateAssessment(trace, assessment(trace, { reportKind: "failed", candidatePass: [false, false] }));
+  assert.equal(out.kind, "terminal_failure");
+  assert.equal(out.rows.length, 2);
+  assert.ok(out.rows.every((r) => r.value === 0));
+});
+
+test("F4: each false gate yields skip with no rows", () => {
+  const gates: Array<Partial<Assessment>> = [
+    { followed: false }, { attributable: false }, { allChecksCompleted: false }, { measurementError: true }, { evidenceRefs: [] },
+  ];
+  for (const g of gates) {
+    const { trace } = seededWithDispatch();
+    const out = evaluateAssessment(trace, assessment(trace, { reportKind: "ready", candidatePass: [true], ...g }));
+    assert.equal(out.kind, "skip", JSON.stringify(g));
+    assert.equal(out.rows.length, 0);
+  }
+});
+
+test("F4: ready with a failed criterion is rejected", () => {
+  const { trace } = seededWithDispatch();
+  assert.throws(() => evaluateAssessment(trace, assessment(trace, { reportKind: "ready", candidatePass: [true, false] })), /ready with failed criterion/);
+});
+
+test("F4: partial improvement failure is terminal failure with positive delta", () => {
+  const { trace } = seededWithDispatch();
+  const out = evaluateAssessment(trace, assessment(trace, { reportKind: "failed", baselinePass: [false, false], candidatePass: [true, false] }));
+  assert.equal(out.kind, "terminal_failure");
+  assert.equal(out.delta, 0.5);
+});
+
+test("F4: null baseline parent is valid", () => {
+  const { trace } = seededWithDispatch({ parentId: null });
+  const out = evaluateAssessment(trace, assessment(trace, { reportKind: "ready", candidatePass: [true] }));
+  assert.equal(out.kind, "terminal_success");
+});
+
+test("F4: blocked with valid evidence is terminal failure, not skip", () => {
+  const { trace } = seededWithDispatch();
+  const out = evaluateAssessment(trace, assessment(trace, { reportKind: "blocked", candidatePass: [true] }));
+  assert.equal(out.kind, "terminal_failure");
+});
+
+test("F4: criterion set mismatches and foreign dispatch throw RangeError", () => {
+  const { trace } = seededWithDispatch();
+  const base = assessment(trace, { reportKind: "failed", candidatePass: [true, false] });
+  const bad: Assessment[] = [
+    { ...base, candidate: { criterionIds: ["c2", "c1"], passed: [true, false] } },
+    { ...base, candidate: { criterionIds: ["c1", "c2"], passed: [true] } },
+    { ...base, baseline: { criterionIds: ["c1", "c2"], passed: [true] } },
+    { ...base, baseline: { criterionIds: [], passed: [] }, candidate: { criterionIds: [], passed: [] } },
+    { ...base, dispatchId: "other" },
+  ];
+  for (const a of bad) assert.throws(() => evaluateAssessment(trace, a), RangeError);
 });
