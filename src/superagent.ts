@@ -904,6 +904,41 @@ export function planSubagentLearning(toolName: string, input: Record<string, unk
   }
 }
 
+/**
+ * Legacy-path diagnostics (spec §9 "legacy keeps input and logs"): name each
+ * malformed or duplicate own tag found in the dispatch text fields. Reports
+ * only tag and reason, never payload text; the input is never changed.
+ */
+export function findOwnTagIssues(input: Record<string, unknown>): Array<{ tag: string; why: "malformed" | "duplicate" }> {
+  const texts: string[] = [];
+  const push = (v: unknown): void => { if (typeof v === "string") texts.push(v); };
+  for (const k of ["context", "prompt", "message", ...TASK_TEXT_FIELDS]) push(input[k]);
+  if (Array.isArray(input.tasks)) {
+    for (const item of input.tasks) {
+      if (item && typeof item === "object") for (const k of TASK_TEXT_FIELDS) push((item as Record<string, unknown>)[k]);
+    }
+  }
+  const seen = new Set<string>();
+  const out: Array<{ tag: string; why: "malformed" | "duplicate" }> = [];
+  const note = (tag: string, err: unknown): void => {
+    const why = String((err as Error)?.message ?? "").includes("duplicate") ? "duplicate" : "malformed";
+    if (seen.has(`${tag}:${why}`)) return;
+    seen.add(`${tag}:${why}`);
+    out.push({ tag, why });
+  };
+  for (const text of texts) {
+    try { locateOwnBlock(text, POLICY_MEMORY_OPEN_TAG, POLICY_MEMORY_CLOSE_TAG, "subagent-policy-memory"); } catch (err) { note("subagent-policy-memory", err); }
+    try { hasFullContractBlock(text); } catch (err) { note("superagent-worker-contract", err); }
+  }
+  return out;
+}
+
+function logOwnTagDiagnostics(rawCwd: string | undefined, toolName: string, input: Record<string, unknown>): void {
+  for (const issue of findOwnTagIssues(input)) {
+    logHarnessCode(rawCwd as string, `W2 k=38 tl=${toolName} tag=${issue.tag} why=${issue.why}`);
+  }
+}
+
 /** Replace each planned envelope with its selected prompt, keeping prefix and suffix text. */
 function applySelectedPrompts(
   input: Record<string, unknown>,
@@ -1553,8 +1588,16 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     }
 
     if (toolName === "task") {
+      const learning = planSubagentLearning(toolName, input);
+      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
+      if (learning.kind === "none") logOwnTagDiagnostics(rawCwd, toolName, input);
+      // Ticket identity, goal and path binding never read raw envelope bytes:
+      // the same goal with another candidate set maps to the same ticket.
+      const scanInput = learning.kind === "dispatch"
+        ? applySelectedPrompts(input, learning, learning.targets.map(() => ""))
+        : input;
       const requestedTicketId = typeof input.ticketId === "string" ? input.ticketId.trim() : "";
-      const requestedGoal = resolveTaskGoal(input);
+      const requestedGoal = resolveTaskGoal(scanInput);
       const waitingTicket = [...state.tickets.values()].find(
         (t) =>
           t.waitsForPerson &&
@@ -1568,18 +1611,16 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           reason: `blocked by superagent watchdog (waits-for-person): ticket ${waitingTicket.ticketId} is waiting for human input (${waitingTicket.stage}). Wait for the next user turn before re-running.`,
         };
       }
-      const learning = planSubagentLearning(toolName, input);
-      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
       let identity: { sessionId: string; callId: string } | undefined;
       if (learning.kind === "dispatch") {
         const id = learningIdentity(ctx, event);
         if ("error" in id) return learningBlock(toolName, id.error);
         identity = id;
       }
-      // Path binding never scans raw envelope JSON; selected prompts are bound after selection.
-      const scanInput = learning.kind === "dispatch"
-        ? applySelectedPrompts(input, learning, learning.targets.map(() => ""))
-        : input;
+      // Snapshot what this dispatch mutates so a learning failure can restore it.
+      const priorMain = state.tickets.get("main");
+      const priorMainPaths = priorMain ? [...priorMain.allowedPaths] : undefined;
+      const priorMainUpdatedAt = priorMain?.updatedAt;
       let paths = extractTargetPaths(scanInput);
       const tasks = Array.isArray(scanInput.tasks) ? scanInput.tasks : undefined;
       if (tasks && tasks.length > 0) {
@@ -1611,6 +1652,9 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
                   t.stage === "failed"),
             )
           : undefined);
+      const priorTicket = ticket
+        ? { stage: ticket.stage, updatedAt: ticket.updatedAt, allowedPaths: [...ticket.allowedPaths] }
+        : undefined;
       if (ticket === undefined) {
         ticket = openTicket(
           state,
@@ -1646,10 +1690,24 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           }
           return { input: out.final };
         } catch (err) {
-          // Nothing is dispatched: release the tracked call and drop the assignment.
+          // Nothing is dispatched: release the tracked call, drop the assignment,
+          // restore the ticket (a new one becomes "blocked") and undo the main binding.
           pendingToolCalls.delete(`${key}::${identity.callId}`);
           assignment.status = "dropped";
           assignment.completedAt = now();
+          if (priorTicket) {
+            ticket.stage = priorTicket.stage;
+            ticket.updatedAt = priorTicket.updatedAt;
+            ticket.allowedPaths = priorTicket.allowedPaths;
+          } else {
+            ticket.stage = "blocked";
+          }
+          if (priorMain === undefined) {
+            if (ticket.ticketId !== "main") state.tickets.delete("main");
+          } else {
+            priorMain.allowedPaths = priorMainPaths!;
+            priorMain.updatedAt = priorMainUpdatedAt!;
+          }
           if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
           return learningBlock(toolName, err instanceof Error ? err.message : String(err));
         }
@@ -1659,8 +1717,14 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     }
 
     if (toolName === "vibe_spawn" || toolName === "vibe_send") {
+      const learning = planSubagentLearning(toolName, input);
+      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
+      if (learning.kind === "none") logOwnTagDiagnostics(rawCwd, toolName, input);
+      const scanInput = learning.kind === "dispatch"
+        ? applySelectedPrompts(input, learning, learning.targets.map(() => ""))
+        : input;
       const requestedTicketId = typeof input.ticketId === "string" ? input.ticketId.trim() : "";
-      const requestedGoal = resolveTaskGoal(input);
+      const requestedGoal = resolveTaskGoal(scanInput);
       const waitingTicket = [...state.tickets.values()].find(
         (t) =>
           t.waitsForPerson &&
@@ -1675,8 +1739,6 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           reason: `blocked by superagent watchdog (waits-for-person): ticket ${waitingTicket.ticketId} is waiting for human input (${waitingTicket.stage}). Wait for the next user turn before re-running.`,
         };
       }
-      const learning = planSubagentLearning(toolName, input);
-      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
       let identity: { sessionId: string; callId: string } | undefined;
       if (learning.kind === "dispatch") {
         const id = learningIdentity(ctx, event);

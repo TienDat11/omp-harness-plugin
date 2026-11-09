@@ -38,7 +38,8 @@ import { fakePi, fakeCtx, tmpDir } from "./_fake-pi.ts";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import tools from "../src/tools.ts";
-import { sessionStateKey, subagentSessionKey } from "../src/skill-telemetry.ts";
+import { sessionStateKey, subagentSessionKey, directionArmId, getSkillTelemetryStore } from "../src/skill-telemetry.ts";
+import { DatabaseSync } from "node:sqlite";
 import superagentDefault, { createSuperagent } from "../src/superagent.ts";
 
 const NOW = 1000;
@@ -1686,4 +1687,125 @@ test("F10: two extension orders keep ledger block and memory block", async () =>
     assert.equal(String(out.context).includes(MEMORY_OPEN), false, "no goal memory forced into shared context");
     for (const item of out.tasks as Array<Record<string, string>>) assertDispatched(item.task);
   }
+});
+
+// ── Task 11 fix round 1 ──
+
+async function withHarnessLog<R>(fn: (logFile: string) => Promise<R>): Promise<R> {
+  const logFile = join(tmpDir(), "global-harness.log");
+  const prev = process.env.OMP_HARNESS_LOG_PATH;
+  process.env.OMP_HARNESS_LOG_PATH = logFile;
+  try {
+    return await fn(logFile);
+  } finally {
+    if (prev === undefined) delete process.env.OMP_HARNESS_LOG_PATH;
+    else process.env.OMP_HARNESS_LOG_PATH = prev;
+  }
+}
+
+test("F10 fix: legacy path logs malformed or duplicate own tags without payload and keeps input", async () => {
+  await withHarnessLog(async (logFile) => {
+    const host = learningHost();
+    const malformed = `note ${MEMORY_OPEN} secret-payload-1`;
+    const r1 = await dispatch(host, "task", taskInput({ context: malformed }), "log-1");
+    assert.equal(r1!.input!.context, `${malformed}\n\n${GOLDFISH_CONTRACT_BLOCK}`, "legacy input kept");
+    const duplicate = `${mem.text}\nsecret-payload-2\n${mem.text}`;
+    const r2 = await dispatch(host, "vibe_spawn", { prompt: duplicate }, "log-2");
+    assert.ok(String(r2!.input!.prompt).startsWith(duplicate.trim()));
+    const contract = `x ${GOLDFISH_CONTRACT_TAG} secret-payload-3`;
+    await dispatch(host, "task", batchInput([{ task: contract }]), "log-3");
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /W2 p=\S+ k=38 tl=task tag=subagent-policy-memory why=malformed/);
+    assert.match(log, /W2 p=\S+ k=38 tl=vibe_spawn tag=subagent-policy-memory why=duplicate/);
+    assert.match(log, /W2 p=\S+ k=38 tl=task tag=superagent-worker-contract why=malformed/);
+    assert.equal(log.includes("secret-payload"), false, "no payload text in the log");
+    // A clean legacy dispatch logs no own-tag diagnostic.
+    const before = readFileSync(logFile, "utf8");
+    await dispatch(host, "task", taskInput({ context: "clean" }), "log-4");
+    assert.equal(readFileSync(logFile, "utf8").split("k=38").length, before.split("k=38").length);
+  });
+});
+
+function snapshotOf(dir: string) {
+  return loadSuperagentSnapshot(dir, `${dir}::test-session`)!;
+}
+
+test("F10 fix: learning failure after bookkeeping leaves ticket out of running, no active assignment, main binding unchanged", async () => {
+  // (a) null store: the DB path is a directory, so the store constructor fails.
+  const a = learningHost();
+  mkdirSync(join(a.dir, ".omp", "harness", "skill-telemetry.db"), { recursive: true });
+  const batchA = batchInput([{ assignment: `# Goal\nedit src/bound.ts\n\n${envelopeTag("goal-null")}` }]);
+  const ra = await dispatch(a, "task", batchA, "fail-null");
+  assert.equal(ra?.block, true);
+  assert.match(String(ra?.reason), /store unavailable/);
+  const sa = snapshotOf(a.dir);
+  assert.equal(sa.tickets.has("main"), false, "main binding undone when it did not exist before");
+  const ta = [...sa.tickets.values()];
+  assert.equal(ta.length, 1);
+  assert.equal(ta[0].stage, "blocked", "a new ticket of a failed learning dispatch is blocked");
+  assert.equal([...sa.assignments.values()].some((x) => x.status === "active"), false);
+
+  // (b) all_excluded: every candidate direction is in cooldown; an existing main binding is restored.
+  const b = learningHost();
+  await dispatch(b, "task", batchInput([{ assignment: "edit src/pre.ts" }]), "pre-1");
+  const pre = snapshotOf(b.dir);
+  const preMain = pre.tickets.get("main")!;
+  const preTicket = [...pre.tickets.values()].find((t) => t.ticketId !== "main")!;
+  // Mark the pre ticket's assignment done so only the learning dispatch could be active.
+  await fire(b.pi, "tool_result", { toolName: "task", toolCallId: "pre-1", content: [{ type: "text", text: "$ node --test\n# pass 1\n[SUPERAGENT-REPORT: ready]" }], isError: false }, b.ctx);
+  const store = getSkillTelemetryStore(b.dir)!;
+  assert.ok(store);
+  const db = new DatabaseSync(join(b.dir, ".omp", "harness", "skill-telemetry.db"));
+  try {
+    const row = db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string };
+    const st = JSON.parse(row.p);
+    st.cooldowns[directionArmId("goal-cool", null, "dir-0")] = { excludedThroughOpportunity: 100, failures: 1 };
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(st));
+  } finally {
+    db.close();
+  }
+  const rb = await dispatch(b, "task", batchInput([{ assignment: `# Goal\nedit src/bound.ts\n\n${envelopeTag("goal-cool")}` }]), "fail-cool");
+  assert.equal(rb?.block, true);
+  assert.match(String(rb?.reason), /excluded by cooldown/);
+  const sb = snapshotOf(b.dir);
+  assert.deepEqual(sb.tickets.get("main")!.allowedPaths, preMain.allowedPaths, "main binding unchanged");
+  assert.equal(sb.tickets.get("main")!.allowedPaths.includes("src/bound.ts"), false);
+  for (const t of sb.tickets.values()) assert.notEqual(t.stage, "running", `${t.ticketId} must not stay running`);
+  assert.equal([...sb.assignments.values()].some((x) => x.status === "active"), false);
+  assert.equal(sb.tickets.get(preTicket.ticketId)!.stage, "ready");
+});
+
+test("F10 fix: same goal with a different envelope reuses the ticket and keeps waits-for-person", async () => {
+  const host = learningHost();
+  const goalText = "# Goal\nShip the widget\n\n";
+  const first = await dispatch(host, "task", taskInput({ context: goalText + envelopeTag("goal-w", ["first prompt"]) }), "w-1");
+  assert.ok(first?.input);
+  const ticketId = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!.ticketId;
+  await fire(host.pi, "tool_result", { toolName: "task", toolCallId: "w-1", content: [{ type: "text", text: "[SUPERAGENT-REPORT: blocked]" }], isError: false }, host.ctx);
+  const other = envelopeTag("goal-w2", ["second prompt", "third prompt"]);
+  const waiting = await dispatch(host, "task", taskInput({ context: goalText + other }), "w-2");
+  assert.equal(waiting?.block, true);
+  assert.match(String(waiting?.reason), new RegExp(`waits-for-person\\): ticket ${ticketId} `));
+  await fire(host.pi, "before_agent_start", {}, host.ctx);
+  const again = await dispatch(host, "task", taskInput({ context: goalText + other }), "w-3");
+  assert.ok(again?.input, JSON.stringify(again));
+  const snap = snapshotOf(host.dir);
+  assert.deepEqual([...snap.tickets.keys()].filter((k) => k !== "main"), [ticketId], "same ticket reused");
+  assert.equal(snap.tickets.get(ticketId)!.goal, "# Goal\nShip the widget");
+  const assigned = [...snap.assignments.values()].filter((x) => x.status === "active");
+  assert.deepEqual(assigned.map((x) => x.ticketId), [ticketId]);
+});
+
+test("F10 fix: a new ticket's targetPaths exclude paths that appear only in candidate scopes", async () => {
+  const host = learningHost();
+  const envelope = `${CANDIDATES_OPEN}${JSON.stringify({
+    version: 1, goalId: "goal-scope",
+    candidates: [{ parentId: null, directionId: "d", mechanism: "m", change: "touch src/scope-only.ts now", scope: ["src/scope-only.ts"], prompt: "Do the widget" }],
+  })}</subagent-candidates>`;
+  const r = await dispatch(host, "task", taskInput({ context: `# Goal\nupdate src/goal.ts\n\n${envelope}` }), "scope-1");
+  assert.ok(r?.input);
+  const ticket = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!;
+  assert.deepEqual(ticket.targetPaths, [normalizePathKey("src/goal.ts")]);
+  assert.equal(ticket.targetPaths.some((p) => p.includes("scope-only")), false);
+  assert.equal(ticket.goal.includes(CANDIDATES_OPEN), false);
 });
