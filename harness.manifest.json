@@ -38,7 +38,7 @@
     "src/superagent.ts": "883441633d2cc7c2fc40de2ec980a1850ab99bf3eaa074eead1eea6f4d1ccc45",
     "src/telemetry.ts": "820471b12952ddd671638a6b9eb7c794cfeb41928c2110e53ced62f5f1308001",
     "src/tools.ts": "9b60276da80f9cbaa5efcfc23276f0ff190ab3e766b5fc5147f24d3be0bf7bbb",
-    "src/verify-gate.ts": "a005f1e7d67d44a0d8195367109b5ff79f52669dead6b27170e33639f4089851",
+    "src/verify-gate.ts": "31986f4899d0a6b61d901e4aaa16ea4165764a9848497c33607acf4fa270275a",
     "src/zeromem.ts": "d7ffebaf0ec4cabd2de67f17895503eb455fe77ba006b630384fd3ea1f6e3135",
     "config/recommended.yml": "59259445eef2ad57b338fb19a2792f9b13515068e7ae01c93735cb87904ecc1e",
     "agents/coder.md": "32ce1571685fc41b316bdfa1ab9247a049acaf78bbe15482620a1324845a46ed",
