@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -132,6 +133,22 @@ test("hashId is SHA-256 of JSON array; other ID domains differ", () => {
   assert.notEqual(observationId(d, "parent", arm), observationId(d, "direction", arm));
   const k = failureKey("g", null, "d", "m", "c", ["b.ts", "a.ts", "a.ts"]);
   assert.equal(k, failureKey("g", null, "d", "m", "c", ["a.ts", "b.ts"]));
+});
+
+test("ID functions match independently computed SHA-256 vectors", () => {
+  const sha = (json: string) => createHash("sha256").update(json, "utf8").digest("hex");
+  assert.equal(parentArmId("g1", null), sha('["parent-v1","g1",null]'));
+  assert.equal(parentArmId("g1", "p1"), sha('["parent-v1","g1","p1"]'));
+  assert.equal(directionArmId("g1", "p1", "d1"), sha('["arm-v1","g1","p1","d1"]'));
+  assert.equal(directionArmId("g1", null, "d1"), sha('["arm-v1","g1",null,"d1"]'));
+  assert.equal(dispatchId("s1", "t1", 2), sha('["dispatch-v1","s1","t1",2]'));
+  const arm = parentArmId("g1", "p1");
+  assert.equal(observationId("dx", "parent", arm), sha(`["observation-v1","dx","parent","${arm}"]`));
+  assert.equal(
+    failureKey("g1", "p1", "d1", "m", "c", ["b.ts", "./a/c.ts", "a/c.ts"]),
+    sha('["failure-v1","g1","p1","d1","m","c",["a/c.ts","b.ts"]]'),
+  );
+  assert.equal(failureKey("g1", null, "d1", "m", "c", ["a.ts"]), sha('["failure-v1","g1",null,"d1","m","c",["a.ts"]]'));
 });
 
 test("scope normalization rejects traversal, absolute, drive and symlink-looking paths", () => {
