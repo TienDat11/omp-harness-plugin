@@ -10,7 +10,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { Dirent } from "node:fs";
@@ -32,7 +32,7 @@ import {
   type SkillDoc,
   type ValveDecision,
 } from "./skill-specs.ts";
-import { SkillTelemetryStore, computeReward, isHardRevert, type SkillRunRecord } from "./skill-telemetry.ts";
+import { type SkillTelemetryStore, getSkillTelemetryStore, closeSkillTelemetryStores, computeReward, isHardRevert, type SkillRunRecord } from "./skill-telemetry.ts";
 import { classifyVerifyCommand, isMutatingTaskCall } from "./verify-gate.ts";
 
 export interface StackInput {
@@ -368,7 +368,6 @@ export function installedSkillFiles(roots: string | string[] = installedSkillDir
 }
 
 /** Repo-local evidence store: skill runs, lift, and the pinned allowlist. */
-const HARNESS_DIR_REL = path.join(".omp", "harness");
 
 interface PinnedEntry {
   l1Digest?: string;
@@ -586,7 +585,6 @@ export default function stackRouter(pi: ExtensionAPI): void {
   const turnCounts = new Map<string, number>();
   const turns = new Map<string, TurnState>();
   const injectedSkills = new Map<string, Set<string>>();
-  const stores = new Map<string, SkillTelemetryStore>();
 
   function corpusFor(cwd: string): SkillCorpus {
     const cached = corpora.get(cwd);
@@ -599,17 +597,7 @@ export default function stackRouter(pi: ExtensionAPI): void {
 
   /** Open the per-repo telemetry store; a locked or read-only workspace degrades to no data. */
   function storeFor(cwd: string): SkillTelemetryStore | null {
-    const cached = stores.get(cwd);
-    if (cached) return cached;
-    try {
-      const dir = path.join(cwd, HARNESS_DIR_REL);
-      mkdirSync(dir, { recursive: true });
-      const store = new SkillTelemetryStore(path.join(dir, "skill-telemetry.db"));
-      stores.set(cwd, store);
-      return store;
-    } catch {
-      return null;
-    }
+    return getSkillTelemetryStore(cwd);
   }
 
   /**
@@ -987,16 +975,12 @@ function branchHasStackAnnouncement(ctx: unknown): boolean {
 
   pi.on("session_shutdown", async (_event, ctx) => {
     if (ctx?.agent?.kind === "sub") return;
-    for (const store of stores.values()) {
-      try {
-        store.close();
-      } catch {
-        // Already closed.
-      }
+    try {
+      closeSkillTelemetryStores();
+    } finally {
+      turnCounts.clear();
+      injectedSkills.clear();
     }
-    stores.clear();
-    turnCounts.clear();
-    injectedSkills.clear();
   });
 
   pi.registerCommand("skill-rate", {

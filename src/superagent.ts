@@ -17,6 +17,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { normalizePathKey, logHarnessCode, writeTextFileAtomic } from "./state.ts";
 import { classifyVerifyCommand, isMutatingTaskCall, READ_ONLY_AGENTS } from "./verify-gate.ts";
+import {
+  canonicalValue,
+  getSkillTelemetryStore,
+  hashId,
+  sessionStateKey,
+  subagentSessionKey,
+  validateCandidateEnvelope,
+  type CandidateEnvelope,
+  type DispatchInput,
+} from "./skill-telemetry.ts";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import type { ExtensionCommandContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 
@@ -603,10 +613,145 @@ export const GOLDFISH_CONTRACT_BLOCK = [
   "</superagent-worker-contract>",
 ].join("\n");
 
+const GOLDFISH_CONTRACT_CLOSE_TAG = "</superagent-worker-contract>";
+export const CANDIDATES_OPEN_TAG = "<subagent-candidates>";
+export const CANDIDATES_CLOSE_TAG = "</subagent-candidates>";
+export const POLICY_MEMORY_OPEN_TAG = "<subagent-policy-memory>";
+export const POLICY_MEMORY_CLOSE_TAG = "</subagent-policy-memory>";
+/** Supported dispatch text fields, in precedence order (spec §9). */
+const TASK_TEXT_FIELDS = ["task", "assignment", "description"] as const;
+
+/**
+ * Internal memory context for the learning branch: the bounded own block from
+ * `getSubagentPolicyMemory` plus its revision. `itemIndex` addresses `tasks[i]`;
+ * `field` names the text field that carried the candidate envelope.
+ */
+export interface SuperagentMemoryContext {
+  revision: string;
+  text: string;
+  itemIndex?: number;
+  field?: string;
+}
+
+function countOf(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
+/** First nonempty string of task → assignment → description. */
+function taskTextField(rec: Record<string, unknown>): string | undefined {
+  return TASK_TEXT_FIELDS.find((k) => typeof rec[k] === "string" && rec[k] !== "");
+}
+
+/**
+ * Locate one full own block (opening and closing tag). Absent → null.
+ * Unbalanced, misordered or repeated tags throw: the learning branch blocks on them.
+ */
+function locateOwnBlock(text: string, open: string, close: string, label: string): { start: number; end: number } | null {
+  const opens = countOf(text, open);
+  const closes = countOf(text, close);
+  if (opens === 0 && closes === 0) return null;
+  if (opens > 1 || closes > 1) throw new Error(`${label}: duplicate tags`);
+  const start = text.indexOf(open);
+  const closeAt = text.indexOf(close);
+  if (opens !== 1 || closes !== 1 || closeAt < start) throw new Error(`${label}: malformed tags`);
+  return { start, end: closeAt + close.length };
+}
+
+/**
+ * The static contract quotes its own opening tag in its rules, so presence is
+ * decided by the single closing tag that follows an opening tag.
+ */
+function hasFullContractBlock(text: string): boolean {
+  const closes = countOf(text, GOLDFISH_CONTRACT_CLOSE_TAG);
+  const opens = countOf(text, GOLDFISH_CONTRACT_TAG);
+  if (closes === 0 && opens === 0) return false;
+  if (closes > 1) throw new Error("superagent-worker-contract: duplicate tags");
+  if (closes === 0 || text.indexOf(GOLDFISH_CONTRACT_TAG) > text.indexOf(GOLDFISH_CONTRACT_CLOSE_TAG)) {
+    throw new Error("superagent-worker-contract: malformed tags");
+  }
+  return true;
+}
+
+function appendBlock(text: string, block: string): string {
+  return text === "" ? block : `${text}\n\n${block}`;
+}
+
+function checkMemoryContext(mc: SuperagentMemoryContext): void {
+  if (
+    !mc || typeof mc.text !== "string" || typeof mc.revision !== "string" || mc.revision === "" ||
+    !mc.text.startsWith(POLICY_MEMORY_OPEN_TAG) || !mc.text.endsWith(POLICY_MEMORY_CLOSE_TAG) ||
+    countOf(mc.text, POLICY_MEMORY_OPEN_TAG) !== 1 || countOf(mc.text, POLICY_MEMORY_CLOSE_TAG) !== 1 ||
+    !mc.text.includes(`\nrevision:${mc.revision}\n`)
+  ) {
+    throw new Error("subagent-policy-memory: memory context is not one full block with its revision");
+  }
+}
+
+/**
+ * Add the static contract when missing, then upsert the own memory block:
+ * same block → byte-identical; different revision → replace the own block only.
+ */
+function applyLearningBlocks(text: string, mc: SuperagentMemoryContext, contractElsewhere: boolean): string {
+  let out = text;
+  if (!hasFullContractBlock(out) && !contractElsewhere) out = appendBlock(out, GOLDFISH_CONTRACT_BLOCK);
+  const loc = locateOwnBlock(out, POLICY_MEMORY_OPEN_TAG, POLICY_MEMORY_CLOSE_TAG, "subagent-policy-memory");
+  if (loc === null) return appendBlock(out, mc.text);
+  if (out.slice(loc.start, loc.end) === mc.text) return out;
+  return out.slice(0, loc.start) + mc.text + out.slice(loc.end);
+}
+
+function resolveLearningTaskInput(
+  input: Record<string, unknown>,
+  memoryContext: SuperagentMemoryContext | readonly SuperagentMemoryContext[],
+): Record<string, unknown> {
+  const list = Array.isArray(memoryContext) ? [...memoryContext] : [memoryContext as SuperagentMemoryContext];
+  if (list.length === 0) throw new Error("subagent-policy-memory: empty memory context");
+  list.forEach(checkMemoryContext);
+  const next: Record<string, unknown> = { ...input };
+  const context = typeof input.context === "string" ? input.context : undefined;
+  const tasks = Array.isArray(input.tasks) && input.tasks.length > 0 ? (input.tasks as unknown[]) : undefined;
+  if (tasks) {
+    const shared = context !== undefined && hasFullContractBlock(context);
+    const updated = [...tasks];
+    const targets = list.length === 1 && list[0].itemIndex === undefined
+      ? tasks.map((_, i) => ({ ...list[0], itemIndex: i }))
+      : list;
+    for (const mc of targets) {
+      const i = mc.itemIndex;
+      if (i === undefined || !Number.isSafeInteger(i) || i < 0 || i >= tasks.length) {
+        throw new Error("subagent-policy-memory: memory context itemIndex out of range");
+      }
+      const item = updated[i];
+      if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`tasks[${i}]: not an object`);
+      const copy = { ...(item as Record<string, unknown>) };
+      const field = mc.field ?? taskTextField(copy);
+      if (field === undefined || typeof copy[field] !== "string") throw new Error(`tasks[${i}]: no supported string field`);
+      copy[field] = applyLearningBlocks(copy[field] as string, mc, shared);
+      updated[i] = copy;
+    }
+    next.tasks = updated;
+    return next;
+  }
+  if (list.length !== 1) throw new Error("subagent-policy-memory: a single task takes one memory context");
+  const mc = list[0];
+  const field = mc.field ?? taskTextField(input) ?? (context !== undefined ? "context" : undefined);
+  if (field === undefined || typeof input[field] !== "string") throw new Error("task: no supported string field");
+  const elsewhere = field !== "context" && context !== undefined && hasFullContractBlock(context);
+  next[field] = applyLearningBlocks(input[field] as string, mc, elsewhere);
+  return next;
+}
+
+/**
+ * Inject the static worker contract (legacy) or, with an internal memory
+ * context (learning branch), the contract plus the own policy-memory block.
+ * The learning form throws on malformed or duplicate own tags.
+ */
 export function resolveSuperagentTaskInput(
   input: Record<string, unknown>,
   state?: SuperagentState,
+  memoryContext?: SuperagentMemoryContext | readonly SuperagentMemoryContext[],
 ): Record<string, unknown> | undefined {
+  if (memoryContext !== undefined) return resolveLearningTaskInput(input, memoryContext);
   const tag = GOLDFISH_CONTRACT_TAG;
   const block = GOLDFISH_CONTRACT_BLOCK;
 
@@ -645,8 +790,176 @@ export function resolveSuperagentTaskInput(
       next.tasks = updatedTasks;
       return next;
     }
+    return undefined;
+  }
+  // Single task without context: task → assignment → description fallback.
+  const field = taskTextField(input);
+  if (field !== undefined && !String(input[field]).includes(tag)) {
+    next[field] = `${String(input[field])}\n\n${block}`;
+    return next;
   }
   return undefined;
+}
+
+type LearningTarget = {
+  itemIndex: number;
+  field: string;
+  start: number;
+  end: number;
+  envelope: CandidateEnvelope;
+  agent: string;
+};
+
+export type SubagentLearningPlan =
+  | { kind: "none" }
+  | { kind: "error"; reason: string }
+  | { kind: "dispatch"; batch: boolean; targets: LearningTarget[] };
+
+function locateEnvelope(text: string, label: string): { start: number; end: number; envelope: CandidateEnvelope } | null {
+  let loc: { start: number; end: number } | null;
+  try {
+    loc = locateOwnBlock(text, CANDIDATES_OPEN_TAG, CANDIDATES_CLOSE_TAG, "subagent-candidates");
+  } catch (err) {
+    throw new Error(`${label}: malformed candidate envelope (${(err as Error).message})`);
+  }
+  if (loc === null) return null;
+  const inner = text.slice(loc.start + CANDIDATES_OPEN_TAG.length, loc.end - CANDIDATES_CLOSE_TAG.length);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(inner);
+  } catch (err) {
+    throw new Error(`${label}: malformed candidate envelope (invalid JSON: ${(err as Error).message})`);
+  }
+  try {
+    return { ...loc, envelope: validateCandidateEnvelope(raw) };
+  } catch (err) {
+    throw new Error(`${label}: malformed candidate envelope (${(err as Error).message})`);
+  }
+}
+
+function hasEnvelopeTag(value: unknown): boolean {
+  return typeof value === "string" && (value.includes(CANDIDATES_OPEN_TAG) || value.includes(CANDIDATES_CLOSE_TAG));
+}
+
+/**
+ * Pure planner for the learning branch (spec §9). `none` when no candidate
+ * envelope tag appears anywhere in the input: the legacy path runs unchanged.
+ */
+export function planSubagentLearning(toolName: string, input: Record<string, unknown>): SubagentLearningPlan {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(input) ?? "";
+  } catch {
+    return { kind: "none" };
+  }
+  if (!serialized.includes(CANDIDATES_OPEN_TAG) && !serialized.includes(CANDIDATES_CLOSE_TAG)) return { kind: "none" };
+  try {
+    const targets: LearningTarget[] = [];
+    let batch = false;
+    if (toolName === "task") {
+      const defaultAgent = resolveTaskAgentName(input, "task");
+      const tasks = Array.isArray(input.tasks) && input.tasks.length > 0 ? (input.tasks as unknown[]) : undefined;
+      if (tasks) {
+        batch = true;
+        if (hasEnvelopeTag(input.context)) {
+          throw new Error("ambiguous batch: candidate envelope in shared context; each tasks[] item carries its own envelope");
+        }
+        tasks.forEach((item, i) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`tasks[${i}]: not an object`);
+          const rec = item as Record<string, unknown>;
+          const field = taskTextField(rec);
+          if (field === undefined) throw new Error(`tasks[${i}]: no supported string field (task, assignment, description)`);
+          if (TASK_TEXT_FIELDS.some((k) => k !== field && hasEnvelopeTag(rec[k]))) {
+            throw new Error(`tasks[${i}]: ambiguous candidate envelope outside the ${field} field`);
+          }
+          const found = locateEnvelope(rec[field] as string, `tasks[${i}].${field}`);
+          if (found === null) throw new Error(`tasks[${i}]: missing candidate envelope; each batch item carries its own`);
+          const agent = typeof rec.agent === "string" && rec.agent.trim() !== "" ? rec.agent.trim() : defaultAgent;
+          targets.push({ itemIndex: i, field, start: found.start, end: found.end, envelope: found.envelope, agent });
+        });
+      } else {
+        const field = taskTextField(input);
+        const inField = field !== undefined && hasEnvelopeTag(input[field]);
+        const inContext = hasEnvelopeTag(input.context);
+        if (inField && inContext) throw new Error("ambiguous task: candidate envelope in both context and task text");
+        const where = inField ? field! : inContext ? "context" : undefined;
+        if (where === undefined) throw new Error("task: no supported string field carries the candidate envelope");
+        const found = locateEnvelope(input[where] as string, where)!;
+        targets.push({ itemIndex: 0, field: where, start: found.start, end: found.end, envelope: found.envelope, agent: defaultAgent });
+      }
+    } else if (toolName === "vibe_spawn" || toolName === "vibe_send") {
+      const field = toolName === "vibe_spawn" ? "prompt" : "message";
+      const found = typeof input[field] === "string" ? locateEnvelope(input[field] as string, field) : null;
+      if (found === null) throw new Error(`${toolName}: candidate envelope must be in ${field}`);
+      targets.push({ itemIndex: 0, field, start: found.start, end: found.end, envelope: found.envelope, agent: resolveTaskAgentName(input, "vibe") });
+    } else {
+      return { kind: "none" };
+    }
+    if (countOf(serialized, CANDIDATES_OPEN_TAG) !== targets.length || countOf(serialized, CANDIDATES_CLOSE_TAG) !== targets.length) {
+      throw new Error("candidate envelope outside a supported dispatch field");
+    }
+    return { kind: "dispatch", batch, targets };
+  } catch (err) {
+    return { kind: "error", reason: (err as Error).message };
+  }
+}
+
+/**
+ * Legacy-path diagnostics (spec §9 "legacy keeps input and logs"): name each
+ * malformed or duplicate own tag found in the dispatch text fields. Reports
+ * only tag and reason, never payload text; the input is never changed.
+ */
+export function findOwnTagIssues(input: Record<string, unknown>): Array<{ tag: string; why: "malformed" | "duplicate" }> {
+  const texts: string[] = [];
+  const push = (v: unknown): void => { if (typeof v === "string") texts.push(v); };
+  for (const k of ["context", "prompt", "message", ...TASK_TEXT_FIELDS]) push(input[k]);
+  if (Array.isArray(input.tasks)) {
+    for (const item of input.tasks) {
+      if (item && typeof item === "object") for (const k of TASK_TEXT_FIELDS) push((item as Record<string, unknown>)[k]);
+    }
+  }
+  const seen = new Set<string>();
+  const out: Array<{ tag: string; why: "malformed" | "duplicate" }> = [];
+  const note = (tag: string, err: unknown): void => {
+    const why = String((err as Error)?.message ?? "").includes("duplicate") ? "duplicate" : "malformed";
+    if (seen.has(`${tag}:${why}`)) return;
+    seen.add(`${tag}:${why}`);
+    out.push({ tag, why });
+  };
+  for (const text of texts) {
+    try { locateOwnBlock(text, POLICY_MEMORY_OPEN_TAG, POLICY_MEMORY_CLOSE_TAG, "subagent-policy-memory"); } catch (err) { note("subagent-policy-memory", err); }
+    try { hasFullContractBlock(text); } catch (err) { note("superagent-worker-contract", err); }
+  }
+  return out;
+}
+
+function logOwnTagDiagnostics(rawCwd: string | undefined, toolName: string, input: Record<string, unknown>): void {
+  for (const issue of findOwnTagIssues(input)) {
+    logHarnessCode(rawCwd as string, `W2 k=38 tl=${toolName} tag=${issue.tag} why=${issue.why}`);
+  }
+}
+
+/** Replace each planned envelope with its selected prompt, keeping prefix and suffix text. */
+function applySelectedPrompts(
+  input: Record<string, unknown>,
+  plan: { batch: boolean; targets: LearningTarget[] },
+  prompts: string[],
+): Record<string, unknown> {
+  const splice = (text: string, t: LearningTarget, prompt: string): string => text.slice(0, t.start) + prompt + text.slice(t.end);
+  const next: Record<string, unknown> = { ...input };
+  if (plan.batch) {
+    const tasks = [...(input.tasks as unknown[])];
+    plan.targets.forEach((t, k) => {
+      const copy = { ...(tasks[t.itemIndex] as Record<string, unknown>) };
+      copy[t.field] = splice(copy[t.field] as string, t, prompts[k]);
+      tasks[t.itemIndex] = copy;
+    });
+    next.tasks = tasks;
+    return next;
+  }
+  const t = plan.targets[0];
+  next[t.field] = splice(input[t.field] as string, t, prompts[0]);
+  return next;
 }
 
 const ABORT_REASON_RE = /<abort-reason>/;
@@ -998,9 +1311,7 @@ export function superagentSessionKey(
   cwd: string | undefined,
   ctx?: SuperagentHookContext,
 ): string {
-  const base = cwd ?? process.cwd();
-  const sessionId = ctx?.sessionManager?.getSessionId?.();
-  return sessionId ? `${base}::${sessionId}` : base;
+  return sessionStateKey(cwd, ctx?.sessionManager?.getSessionId?.());
 }
 
 export function serializeSuperagentState(
@@ -1147,6 +1458,106 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     return { key, cwd, rawCwd, state };
   };
 
+  /**
+   * Learning identity (spec §9): the parent session key from the shared helper
+   * (same derivation as getState and harness_record) plus the host call id.
+   * Never an anonymous queue.
+   */
+  const learningIdentity = (
+    ctx: unknown,
+    event: unknown,
+  ): { sessionId: string; callId: string } | { error: string } => {
+    const c = ctx as SuperagentHookContext | undefined;
+    const sessionId = subagentSessionKey(c?.cwd, c?.sessionManager?.getSessionId?.());
+    if (sessionId === null) return { error: "no host session id for the learning dispatch" };
+    const raw = (event as { toolCallId?: unknown } | undefined)?.toolCallId;
+    if (typeof raw !== "string" || raw === "") return { error: "no toolCallId for the learning dispatch" };
+    return { sessionId, callId: raw };
+  };
+
+  const learningBlock = (toolName: string, reason: string): { block: true; reason: string } => ({
+    block: true,
+    reason: `blocked by superagent learning (${toolName}): ${reason}. Fix the <subagent-candidates> envelope or dispatch without one.`,
+  });
+
+  /**
+   * Select through the production store, replace each envelope with its
+   * selected prompt, then add the static contract (if missing) and the own
+   * bounded memory block. Throws on store failure, all_excluded or bad own tags.
+   */
+  const runLearningDispatch = (
+    toolName: string,
+    input: Record<string, unknown>,
+    plan: { batch: boolean; targets: LearningTarget[] },
+    identity: { sessionId: string; callId: string },
+    cwd: string,
+    ticketId: string,
+    state: SuperagentState,
+  ): { replaced: Record<string, unknown>; final: Record<string, unknown>; prompts: string[] } => {
+    const store = getSkillTelemetryStore(cwd);
+    if (store === null) throw new Error("learning store unavailable");
+    const at = Math.floor(now());
+    const canonicalInput = canonicalValue(input);
+    const inputs: DispatchInput[] = plan.targets.map((t) => ({
+      sessionId: identity.sessionId,
+      toolCallId: identity.callId,
+      itemIndex: t.itemIndex,
+      ticketId,
+      agent: t.agent,
+      envelope: t.envelope,
+      inputHash: hashId(["superagent-dispatch-input-v1", toolName, canonicalInput, t.itemIndex]),
+      now: at,
+    }));
+    const results = store.prepareSubagentDispatchBatch(inputs);
+    if (results.some((r) => r.selected === null)) {
+      throw new Error("all candidates are excluded by cooldown; propose a new direction in a new tool call");
+    }
+    const prompts = results.map((r) => r.selected!.prompt);
+    const replaced = applySelectedPrompts(input, plan, prompts);
+    const contexts: SuperagentMemoryContext[] = results.map((r, k) => ({
+      revision: r.trace.memoryRevision,
+      text: r.memoryText,
+      itemIndex: plan.batch ? plan.targets[k].itemIndex : undefined,
+      field: plan.targets[k].field,
+    }));
+    if (toolName === "task") {
+      const final = resolveSuperagentTaskInput(replaced, state, plan.batch ? contexts : contexts[0])!;
+      return { replaced, final, prompts };
+    }
+    const field = plan.targets[0].field;
+    return { replaced, final: { ...replaced, [field]: applyLearningBlocks(replaced[field] as string, contexts[0], false) }, prompts };
+  };
+
+  /**
+   * Spec §9 startup drain (parent only, caller guards). Failure keeps the
+   * projection pending and logs the error code only; it never throws, so the
+   * session and legacy tools are unaffected.
+   */
+  const drainLearningOutbox = (rawCwd: string | undefined, cwd: string): void => {
+    try {
+      if (typeof rawCwd !== "string" || !path.isAbsolute(rawCwd)) {
+        // "." keeps the cwd value out of the log line (the p= slug derives from it).
+        logHarnessCode(".", "W2 k=39 tl=session_start code=CWD_NOT_ABSOLUTE");
+        return;
+      }
+      // A missing DB has nothing pending; never create the directory or file just to drain.
+      if (!existsSync(path.join(cwd, ".omp", "harness", "skill-telemetry.db"))) {
+        logHarnessCode(rawCwd, "W2 k=39 tl=session_start code=STORE_ABSENT");
+        return;
+      }
+      const store = getSkillTelemetryStore(cwd);
+      if (store === null) {
+        logHarnessCode(rawCwd as string, "W2 k=39 tl=session_start code=STORE_UNAVAILABLE");
+        return;
+      }
+      store.drainPending();
+    } catch (err) {
+      const raw = (err as { code?: unknown } | null)?.code;
+      const code = typeof raw === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(raw) ? raw : "DRAIN_FAILED";
+      logHarnessCode(rawCwd as string, `W2 k=39 tl=session_start code=${code}`);
+    }
+  };
+
   pi.on("session_start", (event, ctx) => {
     if (isSubagent(ctx)) return;
     const c = ctx as SuperagentHookContext | undefined;
@@ -1158,11 +1569,13 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     if (reason === "resume") {
       const restored = loadSuperagentSnapshot(cwd, key) ?? createSuperagentState();
       states.set(key, restored);
+      drainLearningOutbox(rawCwd, cwd);
       return;
     }
     const fresh = createSuperagentState();
     states.set(key, fresh);
     if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, fresh, now());
+    drainLearningOutbox(rawCwd, cwd);
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
@@ -1207,8 +1620,16 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
     }
 
     if (toolName === "task") {
+      const learning = planSubagentLearning(toolName, input);
+      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
+      if (learning.kind === "none") logOwnTagDiagnostics(rawCwd, toolName, input);
+      // Ticket identity, goal and path binding never read raw envelope bytes:
+      // the same goal with another candidate set maps to the same ticket.
+      const scanInput = learning.kind === "dispatch"
+        ? applySelectedPrompts(input, learning, learning.targets.map(() => ""))
+        : input;
       const requestedTicketId = typeof input.ticketId === "string" ? input.ticketId.trim() : "";
-      const requestedGoal = resolveTaskGoal(input);
+      const requestedGoal = resolveTaskGoal(scanInput);
       const waitingTicket = [...state.tickets.values()].find(
         (t) =>
           t.waitsForPerson &&
@@ -1222,8 +1643,18 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           reason: `blocked by superagent watchdog (waits-for-person): ticket ${waitingTicket.ticketId} is waiting for human input (${waitingTicket.stage}). Wait for the next user turn before re-running.`,
         };
       }
-      let paths = extractTargetPaths(input);
-      const tasks = Array.isArray(input.tasks) ? input.tasks : undefined;
+      let identity: { sessionId: string; callId: string } | undefined;
+      if (learning.kind === "dispatch") {
+        const id = learningIdentity(ctx, event);
+        if ("error" in id) return learningBlock(toolName, id.error);
+        identity = id;
+      }
+      // Snapshot what this dispatch mutates so a learning failure can restore it.
+      const priorMain = state.tickets.get("main");
+      const priorMainPaths = priorMain ? [...priorMain.allowedPaths] : undefined;
+      const priorMainUpdatedAt = priorMain?.updatedAt;
+      let paths = extractTargetPaths(scanInput);
+      const tasks = Array.isArray(scanInput.tasks) ? scanInput.tasks : undefined;
       if (tasks && tasks.length > 0) {
         for (const t of tasks) {
           if (t && typeof t === "object") {
@@ -1253,6 +1684,9 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
                   t.stage === "failed"),
             )
           : undefined);
+      const priorTicket = ticket
+        ? { stage: ticket.stage, updatedAt: ticket.updatedAt, allowedPaths: [...ticket.allowedPaths], targetPaths: [...ticket.targetPaths] }
+        : undefined;
       if (ticket === undefined) {
         ticket = openTicket(
           state,
@@ -1264,7 +1698,7 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
       } else if (allowedPaths.length > 0) {
         recordTargetFiles(state, ticket.ticketId, allowedPaths, now());
       }
-      assignWorker(state, ticket.ticketId, agent, now());
+      const assignment = assignWorker(state, ticket.ticketId, agent, now());
       const callId =
         typeof (event as { toolCallId?: unknown })?.toolCallId === "string"
           ? String((event as { toolCallId?: string }).toolCallId)
@@ -1278,13 +1712,52 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
         pendingAnonCalls.set(qKey, q);
       }
       if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
+      if (learning.kind === "dispatch" && identity !== undefined) {
+        try {
+          const out = runLearningDispatch(toolName, input, learning, identity, cwd, ticket.ticketId, state);
+          const selectedPaths = out.prompts.flatMap((p) => extractTargetPaths(p));
+          if (selectedPaths.length > 0 && isMutatingTaskCall(input)) {
+            bindMainTicketPaths(state, selectedPaths, now());
+            if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
+          }
+          return { input: out.final };
+        } catch (err) {
+          // Nothing is dispatched: release the tracked call, drop the assignment,
+          // restore the ticket (a new one becomes "blocked") and undo the main binding.
+          pendingToolCalls.delete(`${key}::${identity.callId}`);
+          assignment.status = "dropped";
+          assignment.completedAt = now();
+          if (priorTicket) {
+            ticket.stage = priorTicket.stage;
+            ticket.updatedAt = priorTicket.updatedAt;
+            ticket.allowedPaths = priorTicket.allowedPaths;
+            ticket.targetPaths = priorTicket.targetPaths;
+          } else {
+            ticket.stage = "blocked";
+          }
+          if (priorMain === undefined) {
+            if (ticket.ticketId !== "main") state.tickets.delete("main");
+          } else {
+            priorMain.allowedPaths = priorMainPaths!;
+            priorMain.updatedAt = priorMainUpdatedAt!;
+          }
+          if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
+          return learningBlock(toolName, err instanceof Error ? err.message : String(err));
+        }
+      }
       const updated = resolveSuperagentTaskInput(input, state);
       if (updated) return { input: updated };
     }
 
     if (toolName === "vibe_spawn" || toolName === "vibe_send") {
+      const learning = planSubagentLearning(toolName, input);
+      if (learning.kind === "error") return learningBlock(toolName, learning.reason);
+      if (learning.kind === "none") logOwnTagDiagnostics(rawCwd, toolName, input);
+      const scanInput = learning.kind === "dispatch"
+        ? applySelectedPrompts(input, learning, learning.targets.map(() => ""))
+        : input;
       const requestedTicketId = typeof input.ticketId === "string" ? input.ticketId.trim() : "";
-      const requestedGoal = resolveTaskGoal(input);
+      const requestedGoal = resolveTaskGoal(scanInput);
       const waitingTicket = [...state.tickets.values()].find(
         (t) =>
           t.waitsForPerson &&
@@ -1299,6 +1772,12 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           reason: `blocked by superagent watchdog (waits-for-person): ticket ${waitingTicket.ticketId} is waiting for human input (${waitingTicket.stage}). Wait for the next user turn before re-running.`,
         };
       }
+      let identity: { sessionId: string; callId: string } | undefined;
+      if (learning.kind === "dispatch") {
+        const id = learningIdentity(ctx, event);
+        if ("error" in id) return learningBlock(toolName, id.error);
+        identity = id;
+      }
       const vibeAgent = resolveTaskAgentName(input, "vibe");
       const vibeTicketId = requestedTicketId || "main";
       const callId =
@@ -1312,6 +1791,21 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
         const q = pendingAnonCalls.get(qKey) ?? [];
         q.push({ ticketId: vibeTicketId, agent: vibeAgent });
         pendingAnonCalls.set(qKey, q);
+      }
+      if (learning.kind === "dispatch" && identity !== undefined) {
+        let out: { replaced: Record<string, unknown>; final: Record<string, unknown> };
+        try {
+          out = runLearningDispatch(toolName, input, learning, identity, cwd, vibeTicketId, state);
+        } catch (err) {
+          pendingToolCalls.delete(`${key}::${identity.callId}`);
+          return learningBlock(toolName, err instanceof Error ? err.message : String(err));
+        }
+        if (toolName === "vibe_spawn") {
+          const paths = extractTargetPaths(String(out.replaced.prompt));
+          if (paths.length > 0 && isMutatingTaskCall(input)) bindMainTicketPaths(state, paths, now());
+          if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
+        }
+        return { input: out.final };
       }
       if (toolName === "vibe_spawn") {
         const prompt = typeof input.prompt === "string" ? input.prompt : "";

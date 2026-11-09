@@ -18,6 +18,7 @@ import {
   DEFAULT_MAX_SURGICAL_FILES,
   SUPERAGENT_CONTRACT_TAG,
   GOLDFISH_CONTRACT_TAG,
+  GOLDFISH_CONTRACT_BLOCK,
   resolveSuperagentTaskInput,
   extractToolResultOutput,
   resolveTaskAgentName,
@@ -31,8 +32,14 @@ import {
   loadSuperagentSnapshot,
   type SuperagentState,
 } from "../src/superagent.ts";
-import { normalizePathKey } from "../src/state.ts";
+import { normalizePathKey, rememberReadStat } from "../src/state.ts";
+import { resolveTaskInput as resolveReadBudgetTaskInput, PARENT_LEDGER_TAG } from "../src/read-budget.ts";
 import { fakePi, fakeCtx, tmpDir } from "./_fake-pi.ts";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import tools from "../src/tools.ts";
+import { sessionStateKey, subagentSessionKey, directionArmId, getSkillTelemetryStore } from "../src/skill-telemetry.ts";
+import { DatabaseSync } from "node:sqlite";
 import superagentDefault, { createSuperagent } from "../src/superagent.ts";
 
 const NOW = 1000;
@@ -1315,4 +1322,622 @@ test("AC-06 snapshot persistence round-trip and resume", async () => {
   assert.deepEqual(hyd.degradedCounts, restored!.degradedCounts);
   assert.deepEqual(hyd.escalateAfter, restored!.escalateAfter);
   assert.equal(drainPendingInspections(createSuperagentState()), undefined);
+});
+
+// ── Task 10: shared session identity and legacy harness_record regression ──
+
+test("getState session key and harness_record learning key come from one helper", async () => {
+  const dir = tmpDir();
+  const ctx = fakeCtx(dir);
+  // The persisted snapshot is keyed by getState(ctx).key; the learning key must equal it.
+  const pi = fakePi();
+  mount(pi);
+  await fire(pi, "session_start", {}, ctx);
+  await fire(pi, "tool_call", { toolName: "task", toolCallId: "k1", input: { goal: "key", agent: "coder" } }, ctx);
+  const snapshot = JSON.parse(readFileSync(join(dir, ".omp", "harness", "superagent-state.json"), "utf8")) as { sessions: Record<string, unknown> };
+  const learningKey = subagentSessionKey(ctx.cwd, ctx.sessionManager.getSessionId());
+  assert.equal(learningKey, `${dir}::test-session`);
+  assert.deepEqual(Object.keys(snapshot.sessions), [learningKey]);
+  for (const [cwd, sid] of [[dir, "abc"], [undefined, "abc"], ["rel/dir", "x::y"]] as Array<[string | undefined, string]>) {
+    const c = { cwd, sessionManager: { getSessionId: () => sid } };
+    assert.equal(superagentSessionKey(cwd, c), sessionStateKey(cwd, sid));
+    assert.equal(subagentSessionKey(cwd, sid), superagentSessionKey(cwd, c));
+  }
+  // Without a host session id getState keeps its cwd-only key; learning has no identity.
+  assert.equal(superagentSessionKey(dir, { cwd: dir }), dir);
+  assert.equal(subagentSessionKey(dir, undefined), null);
+  assert.equal(subagentSessionKey(dir, ""), null);
+});
+
+test("legacy harness_record without subagentEvaluations is unchanged", async () => {
+  const dir = tmpDir();
+  const intake = join(dir, ".omp", "work", "2026-11-09", "legacy");
+  mkdirSync(intake, { recursive: true });
+  const pi = fakePi();
+  tools(pi as never);
+  const def = pi.tools.get("harness_record") as unknown as {
+    execute: (id: string, p: Record<string, unknown>, s: unknown, u: unknown, c: unknown) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }>;
+  };
+  const params = {
+    dir: intake, tier: "M", goal: "legacy goal",
+    acceptance: [{ id: "A1", joint: "verify", check: "c", pass: true, evidence: "e" }, { id: "A2", joint: "review", check: "c2", pass: false, evidence: "e2" }],
+    models: ["m"], tokens: 7, wall_ms: 9, notes: "n",
+  };
+  const file = join(intake, "outcome.json");
+  for (const ctx of [fakeCtx(dir), { ...fakeCtx(dir), agent: { kind: "sub" } }, undefined]) {
+    const r = await def.execute("rec-1", params, undefined, undefined, ctx);
+    assert.equal(r.content[0].text, `harness_record: ${file}\nacceptance: 2 total, 1 failed`);
+    assert.deepEqual(Object.keys(r.details).sort(), ["failed", "file", "lesson_cue"]);
+    const outcome = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const expectedKeys = ["task", "dir", "tier", "goal", "acceptance", "models", "tokens", "wall_ms", "notes", "sessionTelemetry", "recorded_at"];
+    assert.deepEqual(Object.keys(outcome), expectedKeys.filter((k) => k in outcome));
+    assert.equal(outcome.task, "legacy");
+    assert.equal(outcome.dir, intake);
+    assert.equal(outcome.tokens, 7);
+    assert.equal(outcome.notes, "n");
+  }
+  assert.equal(existsSync(join(dir, ".omp", "harness", "skill-telemetry.db")), false, "legacy path opens no learning store");
+});
+
+// ── Task 11 (F10): dispatch envelope, selection and memory adapters ──
+
+const CANDIDATES_OPEN = "<subagent-candidates>";
+const MEMORY_OPEN = "<subagent-policy-memory>";
+const MEMORY_CLOSE = "</subagent-policy-memory>";
+const prefix = "# Goal\nShip the widget\n\n";
+const suffix = "\n\nTrailing instructions stay.";
+const selectedPrompt = "Selected prompt: edit src/widget.ts only";
+
+function envelopeTag(goalId = "goal-f10", prompts: string[] = [selectedPrompt]): string {
+  const candidates = prompts.map((p, i) => ({
+    parentId: null, directionId: `dir-${i}`, mechanism: `mechanism ${i}`, change: `change ${i}`, scope: ["src/widget.ts"], prompt: p,
+  }));
+  return `${CANDIDATES_OPEN}${JSON.stringify({ version: 1, goalId, candidates })}</subagent-candidates>`;
+}
+
+function taskInput(fields: Record<string, unknown>): Record<string, unknown> {
+  return { agent: "coder", ...fields };
+}
+
+function batchInput(items: Array<Record<string, unknown>>, shared: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...shared, tasks: items.map((it) => ({ agent: "coder", ...it })) };
+}
+
+const mem = { revision: "rev-1", text: `${MEMORY_OPEN}\nrevision:rev-1\n{"lessons":[],"cooldowns":[],"excludedCount":0}\n${MEMORY_CLOSE}` };
+const mem2 = { revision: "rev-2", text: `${MEMORY_OPEN}\nrevision:rev-2\n{"lessons":[],"cooldowns":["x"],"excludedCount":0}\n${MEMORY_CLOSE}` };
+
+function count(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
+
+type HookResult = { input?: Record<string, unknown>; block?: boolean; reason?: string } | undefined;
+
+function learningHost(): { pi: ReturnType<typeof fakePi>; ctx: ReturnType<typeof fakeCtx>; dir: string } {
+  const dir = tmpDir();
+  const pi = fakePi();
+  mount(pi);
+  return { pi, ctx: fakeCtx(dir), dir };
+}
+
+async function dispatch(
+  host: { pi: ReturnType<typeof fakePi>; ctx: unknown },
+  toolName: string,
+  input: Record<string, unknown>,
+  toolCallId: string | undefined,
+): Promise<HookResult> {
+  const event: Record<string, unknown> = { toolName, input };
+  if (toolCallId !== undefined) event.toolCallId = toolCallId;
+  return (await fire(host.pi, "tool_call", event, host.ctx)) as HookResult;
+}
+
+function assertDispatched(text: string, prompt: string = selectedPrompt): void {
+  assert.ok(text.includes(prompt), `selected prompt missing: ${text}`);
+  assert.equal(text.includes(CANDIDATES_OPEN), false, "envelope must be replaced");
+  assert.equal(count(text, GOLDFISH_CONTRACT_BLOCK), 1, "static contract exactly once");
+  assert.equal(count(text, MEMORY_OPEN), 1, "own memory block exactly once");
+  assert.equal(count(text, MEMORY_CLOSE), 1);
+  assert.match(text, /<subagent-policy-memory>\nrevision:[0-9a-f]{64}\n\{"lessons":\[/);
+}
+
+test("F10: single task context receives selected prompt and memory, prefix kept", async () => {
+  const host = learningHost();
+  const r = await dispatch(host, "task", taskInput({ context: prefix + envelopeTag() + suffix }), "f10-ctx");
+  assert.ok(r?.input, JSON.stringify(r));
+  const out = String(r.input.context);
+  assertDispatched(out);
+  assert.ok(out.startsWith(prefix + selectedPrompt + suffix), out);
+  // The selection is persisted as a real trace in the production store.
+  assert.ok(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")));
+});
+
+test("F10: single task field precedence task, then assignment, then description", async () => {
+  const host = learningHost();
+  const viaTask = await dispatch(host, "task", taskInput({ task: prefix + envelopeTag(), assignment: "other", context: "shared" }), "p-task");
+  assertDispatched(String(viaTask!.input!.task));
+  assert.equal(viaTask!.input!.assignment, "other");
+  assert.equal(viaTask!.input!.context, "shared");
+  const viaAssignment = await dispatch(host, "task", taskInput({ task: "", assignment: prefix + envelopeTag() }), "p-assign");
+  assertDispatched(String(viaAssignment!.input!.assignment));
+  assert.ok(String(viaAssignment!.input!.assignment).startsWith(prefix));
+  const viaDescription = await dispatch(host, "task", taskInput({ description: envelopeTag() + suffix }), "p-desc");
+  assertDispatched(String(viaDescription!.input!.description));
+  assert.ok(String(viaDescription!.input!.description).includes(suffix));
+});
+
+test("F10: tasks[].task, assignment, description precedence", async () => {
+  const host = learningHost();
+  const input = batchInput(
+    [
+      { task: prefix + envelopeTag("goal-a", ["prompt for item zero"]) },
+      { task: "", assignment: envelopeTag("goal-b", ["prompt for item one"]) + suffix },
+      { description: envelopeTag("goal-c", ["prompt for item two"]) },
+    ],
+    { context: "shared instructions only" },
+  );
+  const r = await dispatch(host, "task", input, "batch-1");
+  assert.ok(r?.input, JSON.stringify(r));
+  const tasks = r.input.tasks as Array<Record<string, string>>;
+  assertDispatched(tasks[0].task, "prompt for item zero");
+  assert.ok(tasks[0].task.startsWith(prefix));
+  assertDispatched(tasks[1].assignment, "prompt for item one");
+  assert.ok(tasks[1].assignment.startsWith("prompt for item one" + suffix));
+  assertDispatched(tasks[2].description, "prompt for item two");
+  assert.equal(r.input.context, "shared instructions only", "shared context keeps instructions only");
+});
+
+test("F10: spawn.prompt and send.message receive selected prompt", async () => {
+  const host = learningHost();
+  const spawn = await dispatch(host, "vibe_spawn", { name: "w1", prompt: prefix + envelopeTag() + suffix }, "spawn-1");
+  const prompt = String(spawn!.input!.prompt);
+  assertDispatched(prompt);
+  assert.ok(prompt.startsWith(prefix + selectedPrompt + suffix), prompt);
+  const withContract = `${prefix}${envelopeTag()}\n\n${GOLDFISH_CONTRACT_BLOCK}`;
+  const spawn2 = await dispatch(host, "vibe_spawn", { name: "w2", prompt: withContract }, "spawn-2");
+  assertDispatched(String(spawn2!.input!.prompt));
+  const send = await dispatch(host, "vibe_send", { id: "w1", message: prefix + envelopeTag() + suffix }, "send-1");
+  const message = String(send!.input!.message);
+  assertDispatched(message);
+  assert.ok(message.startsWith(prefix + selectedPrompt + suffix), message);
+  // Legacy vibe_send without an envelope is untouched.
+  assert.equal(await dispatch(host, "vibe_send", { id: "w1", message: "plain" }, "send-2"), undefined);
+});
+
+test("F10: ambiguous envelope in shared context and item rejects batch", async () => {
+  const host = learningHost();
+  const ambiguous = batchInput([{ task: envelopeTag() }, { task: envelopeTag("goal-2") }], { context: envelopeTag("goal-3") });
+  const r = await dispatch(host, "task", ambiguous, "amb-1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /ambiguous/);
+  const missing = await dispatch(host, "task", batchInput([{ task: envelopeTag() }, { task: "no envelope here" }]), "amb-2");
+  assert.equal(missing?.block, true);
+  assert.match(String(missing?.reason), /tasks\[1\]/);
+  const singleBoth = await dispatch(host, "task", taskInput({ task: envelopeTag(), context: envelopeTag("goal-x") }), "amb-3");
+  assert.equal(singleBoth?.block, true);
+  assert.match(String(singleBoth?.reason), /ambiguous/);
+  // The legacy adapter keeps its input for the same batch.
+  const legacy = resolveSuperagentTaskInput(ambiguous);
+  assert.ok(legacy);
+  assert.ok(String(legacy.context).includes(GOLDFISH_CONTRACT_TAG));
+});
+
+test("F10: no-envelope legacy task with no supported string field keeps legacy behavior", async () => {
+  const plain = resolveSuperagentTaskInput(taskInput({ task: undefined, context: "plain" }), freshState(), undefined);
+  assert.ok(plain);
+  assert.equal(plain.context, `plain\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  assert.equal(resolveSuperagentTaskInput(taskInput({}), freshState(), undefined), undefined);
+  // Single-task fallback: no context, no tasks batch → task, then assignment, then description.
+  const single = resolveSuperagentTaskInput({ task: "", assignment: "do x" });
+  assert.equal(single?.assignment, `do x\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  assert.equal(single?.task, "");
+  // Disk/DB failure never touches the no-envelope legacy path.
+  const host = learningHost();
+  mkdirSync(join(host.dir, ".omp"), { recursive: true });
+  writeFileSync(join(host.dir, ".omp", "harness"), "not a directory");
+  const legacy = await dispatch(host, "task", taskInput({ context: "plain" }), "legacy-1");
+  assert.equal(String(legacy!.input!.context), `plain\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+  const spawn = await dispatch(host, "vibe_spawn", { prompt: "edit src/a.ts" }, "legacy-2");
+  assert.ok(String(spawn!.input!.prompt).includes(GOLDFISH_CONTRACT_TAG));
+  // The learning branch fails closed on the same broken store.
+  const learning = await dispatch(host, "task", taskInput({ context: envelopeTag() }), "learn-1");
+  assert.equal(learning?.block, true);
+  assert.match(String(learning?.reason), /store unavailable/);
+});
+
+test("F10: legacy dispatch without envelope opens no learning store", async () => {
+  const host = learningHost();
+  await dispatch(host, "task", taskInput({ context: "plain" }), "l1");
+  await dispatch(host, "vibe_spawn", { prompt: "edit src/a.ts" }, "l2");
+  assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+});
+
+test("F10: missing session or call identity blocks learning, legacy continues; sub never learns", async () => {
+  const host = learningHost();
+  const noCall = await dispatch(host, "task", taskInput({ context: envelopeTag() }), undefined);
+  assert.equal(noCall?.block, true);
+  assert.match(String(noCall?.reason), /toolCallId/);
+  const noSession = { pi: host.pi, ctx: { cwd: host.dir } };
+  const r = await dispatch(noSession, "task", taskInput({ context: envelopeTag() }), "c1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /session/);
+  const legacy = await dispatch(noSession, "task", taskInput({ context: "plain" }), undefined);
+  assert.ok(String(legacy!.input!.context).includes(GOLDFISH_CONTRACT_TAG));
+  const sub = { pi: host.pi, ctx: { ...fakeCtx(host.dir), agent: { kind: "sub" } } };
+  assert.equal(await dispatch(sub, "task", taskInput({ context: envelopeTag() }), "c2"), undefined);
+  assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+});
+
+test("F10: malformed envelope fails learning, legacy path still returns input", async () => {
+  const host = learningHost();
+  const badJson = taskInput({ context: `${prefix}${CANDIDATES_OPEN}{not json</subagent-candidates>` });
+  const r = await dispatch(host, "task", badJson, "bad-1");
+  assert.equal(r?.block, true);
+  assert.match(String(r?.reason), /malformed candidate envelope/);
+  const legacy = resolveSuperagentTaskInput(badJson);
+  assert.ok(legacy);
+  assert.ok(String(legacy.context).startsWith(String(badJson.context)));
+  const unclosed = await dispatch(host, "task", taskInput({ context: `${CANDIDATES_OPEN}{}` }), "bad-2");
+  assert.equal(unclosed?.block, true);
+  const duplicate = await dispatch(host, "task", taskInput({ context: envelopeTag() + envelopeTag() }), "bad-3");
+  assert.equal(duplicate?.block, true);
+  const badVersion = await dispatch(host, "vibe_spawn", { prompt: envelopeTag().replace('"version":1', '"version":2') }, "bad-4");
+  assert.equal(badVersion?.block, true);
+  assert.match(String(badVersion?.reason), /version/);
+  const outside = await dispatch(host, "task", taskInput({ context: "plain", goal: envelopeTag() }), "bad-5");
+  assert.equal(outside?.block, true);
+  // The session keeps working after a failed learning branch.
+  const next = await dispatch(host, "task", taskInput({ context: envelopeTag() }), "ok-1");
+  assertDispatched(String(next!.input!.context));
+});
+
+test("F10: replayed tool call returns the same selection and byte-identical text", async () => {
+  const host = learningHost();
+  const input = taskInput({ context: prefix + envelopeTag("goal-r", ["alpha prompt", "beta prompt"]) });
+  const first = await dispatch(host, "task", input, "replay-1");
+  const second = await dispatch(host, "task", input, "replay-1");
+  assert.equal(String(second!.input!.context), String(first!.input!.context));
+  const out = String(first!.input!.context);
+  assert.equal(Number(out.includes("alpha prompt")) + Number(out.includes("beta prompt")), 1, "exactly one candidate selected");
+});
+
+test("F10: own memory block revision semantics and full-block detection", () => {
+  const base = taskInput({ task: `${prefix}${selectedPrompt}` });
+  const once = resolveSuperagentTaskInput(base, freshState(), mem)!;
+  const text = String(once.task);
+  assert.ok(text.startsWith(prefix + selectedPrompt));
+  assert.equal(count(text, GOLDFISH_CONTRACT_BLOCK), 1);
+  assert.equal(count(text, mem.text), 1);
+  // Same revision: byte-identical, no duplicate.
+  const again = resolveSuperagentTaskInput(once, freshState(), mem)!;
+  assert.equal(again.task, text);
+  // Different revision: only the own block is replaced.
+  const replaced = String(resolveSuperagentTaskInput(once, freshState(), mem2)!.task);
+  assert.equal(replaced, text.replace(mem.text, mem2.text));
+  // Opening tag without a closing tag is malformed, not "present".
+  assert.throws(() => resolveSuperagentTaskInput(taskInput({ task: `x ${MEMORY_OPEN} y` }), freshState(), mem), /malformed/);
+  assert.throws(() => resolveSuperagentTaskInput(taskInput({ task: `${mem.text}\n${mem.text}` }), freshState(), mem), /duplicate/);
+  assert.throws(
+    () => resolveSuperagentTaskInput(taskInput({ task: `x ${GOLDFISH_CONTRACT_TAG} unclosed` }), freshState(), mem),
+    /malformed/,
+  );
+  // A batch memory context targets its own item only.
+  const batch = resolveSuperagentTaskInput(
+    batchInput([{ task: "a" }, { assignment: "b" }]),
+    freshState(),
+    [{ ...mem, itemIndex: 1 }],
+  )!;
+  const items = batch.tasks as Array<Record<string, string>>;
+  assert.equal(items[0].task, "a");
+  assert.ok(items[1].assignment.startsWith("b\n\n"));
+  assert.equal(count(items[1].assignment, mem.text), 1);
+  // Legacy path (no memory context) keeps user text with stray own tags and still adds the contract.
+  const legacy = resolveSuperagentTaskInput({ context: `note ${MEMORY_OPEN}` });
+  assert.equal(legacy?.context, `note ${MEMORY_OPEN}\n\n${GOLDFISH_CONTRACT_BLOCK}`);
+});
+
+function ledgerFixture(cwd: string): unknown[] {
+  writeFileSync(join(cwd, "file.ts"), "const a = 1;\n");
+  const st = statSync(join(cwd, "file.ts"));
+  rememberReadStat("ledger-read-1", st.mtimeMs, st.size);
+  return [
+    { type: "message", id: "e1", message: { role: "assistant", content: [{ type: "toolCall", id: "ledger-read-1", name: "read", arguments: { path: "file.ts" } }] } },
+    { type: "message", id: "e2", message: { role: "toolResult", toolCallId: "ledger-read-1", toolName: "read", content: [{ type: "text", text: "[file.ts#A1B2]\n1:const a = 1;\n" }] } },
+  ];
+}
+
+function blocksOf(text: string, open: string, close: string): string[] {
+  const out: string[] = [];
+  let at = text.indexOf(open);
+  while (at >= 0) {
+    const end = text.indexOf(close, at);
+    out.push(text.slice(at, end + close.length));
+    at = text.indexOf(open, end);
+  }
+  return out;
+}
+
+test("F10: two extension orders keep ledger block and memory block", async () => {
+  const host = learningHost();
+  const branch = ledgerFixture(host.dir);
+  const LEDGER_CLOSE = "</parent-read-ledger>";
+
+  // Single task: both adapters write into input.task.
+  const single = taskInput({ task: prefix + envelopeTag() });
+  const ledgerFirst = resolveReadBudgetTaskInput(single, branch, host.dir)!;
+  const ledgerBlock = blocksOf(String(ledgerFirst.task), PARENT_LEDGER_TAG, LEDGER_CLOSE);
+  assert.equal(ledgerBlock.length, 1);
+  const a = String((await dispatch(host, "task", ledgerFirst, "order-1"))!.input!.task);
+  const memoryFirst = (await dispatch(host, "task", single, "order-2"))!.input!;
+  const b = String(resolveReadBudgetTaskInput(memoryFirst, branch, host.dir)!.task);
+  for (const out of [a, b]) {
+    assertDispatched(out);
+    assert.deepEqual(blocksOf(out, PARENT_LEDGER_TAG, LEDGER_CLOSE), ledgerBlock);
+    assert.ok(out.startsWith(prefix + selectedPrompt));
+  }
+  assert.deepEqual(blocksOf(a, MEMORY_OPEN, MEMORY_CLOSE), blocksOf(b, MEMORY_OPEN, MEMORY_CLOSE));
+
+  // Batch: ledger owns shared context, memory owns the item text.
+  const batch = batchInput([{ task: envelopeTag("goal-b1") }, { task: envelopeTag("goal-b2") }], { context: "shared" });
+  const ledgerBatch = resolveReadBudgetTaskInput(batch, branch, host.dir)!;
+  const ledgerBatchBlock = blocksOf(String(ledgerBatch.context), PARENT_LEDGER_TAG, LEDGER_CLOSE);
+  assert.equal(ledgerBatchBlock.length, 1);
+  const c = (await dispatch(host, "task", ledgerBatch, "order-3"))!.input!;
+  const d = resolveReadBudgetTaskInput((await dispatch(host, "task", batch, "order-4"))!.input!, branch, host.dir)!;
+  for (const out of [c, d]) {
+    assert.deepEqual(blocksOf(String(out.context), PARENT_LEDGER_TAG, LEDGER_CLOSE), ledgerBatchBlock);
+    assert.equal(String(out.context).includes(MEMORY_OPEN), false, "no goal memory forced into shared context");
+    for (const item of out.tasks as Array<Record<string, string>>) assertDispatched(item.task);
+  }
+});
+
+// ── Task 11 fix round 1 ──
+
+async function withHarnessLog<R>(fn: (logFile: string) => Promise<R>): Promise<R> {
+  const logFile = join(tmpDir(), "global-harness.log");
+  const prev = process.env.OMP_HARNESS_LOG_PATH;
+  process.env.OMP_HARNESS_LOG_PATH = logFile;
+  try {
+    return await fn(logFile);
+  } finally {
+    if (prev === undefined) delete process.env.OMP_HARNESS_LOG_PATH;
+    else process.env.OMP_HARNESS_LOG_PATH = prev;
+  }
+}
+
+test("F10 fix: legacy path logs malformed or duplicate own tags without payload and keeps input", async () => {
+  await withHarnessLog(async (logFile) => {
+    const host = learningHost();
+    const malformed = `note ${MEMORY_OPEN} secret-payload-1`;
+    const r1 = await dispatch(host, "task", taskInput({ context: malformed }), "log-1");
+    assert.equal(r1!.input!.context, `${malformed}\n\n${GOLDFISH_CONTRACT_BLOCK}`, "legacy input kept");
+    const duplicate = `${mem.text}\nsecret-payload-2\n${mem.text}`;
+    const r2 = await dispatch(host, "vibe_spawn", { prompt: duplicate }, "log-2");
+    assert.ok(String(r2!.input!.prompt).startsWith(duplicate.trim()));
+    const contract = `x ${GOLDFISH_CONTRACT_TAG} secret-payload-3`;
+    await dispatch(host, "task", batchInput([{ task: contract }]), "log-3");
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /W2 p=\S+ k=38 tl=task tag=subagent-policy-memory why=malformed/);
+    assert.match(log, /W2 p=\S+ k=38 tl=vibe_spawn tag=subagent-policy-memory why=duplicate/);
+    assert.match(log, /W2 p=\S+ k=38 tl=task tag=superagent-worker-contract why=malformed/);
+    assert.equal(log.includes("secret-payload"), false, "no payload text in the log");
+    // A clean legacy dispatch logs no own-tag diagnostic.
+    const before = readFileSync(logFile, "utf8");
+    await dispatch(host, "task", taskInput({ context: "clean" }), "log-4");
+    assert.equal(readFileSync(logFile, "utf8").split("k=38").length, before.split("k=38").length);
+  });
+});
+
+function snapshotOf(dir: string) {
+  return loadSuperagentSnapshot(dir, `${dir}::test-session`)!;
+}
+
+test("F10 fix: learning failure after bookkeeping leaves ticket out of running, no active assignment, main binding unchanged", async () => {
+  // (a) null store: the DB path is a directory, so the store constructor fails.
+  const a = learningHost();
+  mkdirSync(join(a.dir, ".omp", "harness", "skill-telemetry.db"), { recursive: true });
+  const batchA = batchInput([{ assignment: `# Goal\nedit src/bound.ts\n\n${envelopeTag("goal-null")}` }]);
+  const ra = await dispatch(a, "task", batchA, "fail-null");
+  assert.equal(ra?.block, true);
+  assert.match(String(ra?.reason), /store unavailable/);
+  const sa = snapshotOf(a.dir);
+  assert.equal(sa.tickets.has("main"), false, "main binding undone when it did not exist before");
+  const ta = [...sa.tickets.values()];
+  assert.equal(ta.length, 1);
+  assert.equal(ta[0].stage, "blocked", "a new ticket of a failed learning dispatch is blocked");
+  assert.equal([...sa.assignments.values()].some((x) => x.status === "active"), false);
+
+  // (b) all_excluded: every candidate direction is in cooldown; an existing main binding is restored.
+  const b = learningHost();
+  await dispatch(b, "task", batchInput([{ assignment: "edit src/pre.ts" }]), "pre-1");
+  const pre = snapshotOf(b.dir);
+  const preMain = pre.tickets.get("main")!;
+  const preTicket = [...pre.tickets.values()].find((t) => t.ticketId !== "main")!;
+  // Mark the pre ticket's assignment done so only the learning dispatch could be active.
+  await fire(b.pi, "tool_result", { toolName: "task", toolCallId: "pre-1", content: [{ type: "text", text: "$ node --test\n# pass 1\n[SUPERAGENT-REPORT: ready]" }], isError: false }, b.ctx);
+  const store = getSkillTelemetryStore(b.dir)!;
+  assert.ok(store);
+  const db = new DatabaseSync(join(b.dir, ".omp", "harness", "skill-telemetry.db"));
+  try {
+    const row = db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string };
+    const st = JSON.parse(row.p);
+    st.cooldowns[directionArmId("goal-cool", null, "dir-0")] = { excludedThroughOpportunity: 100, failures: 1 };
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(st));
+  } finally {
+    db.close();
+  }
+  const rb = await dispatch(b, "task", batchInput([{ assignment: `# Goal\nedit src/bound.ts\n\n${envelopeTag("goal-cool")}` }]), "fail-cool");
+  assert.equal(rb?.block, true);
+  assert.match(String(rb?.reason), /excluded by cooldown/);
+  const sb = snapshotOf(b.dir);
+  assert.deepEqual(sb.tickets.get("main")!.allowedPaths, preMain.allowedPaths, "main binding unchanged");
+  assert.equal(sb.tickets.get("main")!.allowedPaths.includes("src/bound.ts"), false);
+  for (const t of sb.tickets.values()) assert.notEqual(t.stage, "running", `${t.ticketId} must not stay running`);
+  assert.equal([...sb.assignments.values()].some((x) => x.status === "active"), false);
+  assert.equal(sb.tickets.get(preTicket.ticketId)!.stage, "ready");
+});
+
+test("F10 fix: same goal with a different envelope reuses the ticket and keeps waits-for-person", async () => {
+  const host = learningHost();
+  const goalText = "# Goal\nShip the widget\n\n";
+  const first = await dispatch(host, "task", taskInput({ context: goalText + envelopeTag("goal-w", ["first prompt"]) }), "w-1");
+  assert.ok(first?.input);
+  const ticketId = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!.ticketId;
+  await fire(host.pi, "tool_result", { toolName: "task", toolCallId: "w-1", content: [{ type: "text", text: "[SUPERAGENT-REPORT: blocked]" }], isError: false }, host.ctx);
+  const other = envelopeTag("goal-w2", ["second prompt", "third prompt"]);
+  const waiting = await dispatch(host, "task", taskInput({ context: goalText + other }), "w-2");
+  assert.equal(waiting?.block, true);
+  assert.match(String(waiting?.reason), new RegExp(`waits-for-person\\): ticket ${ticketId} `));
+  await fire(host.pi, "before_agent_start", {}, host.ctx);
+  const again = await dispatch(host, "task", taskInput({ context: goalText + other }), "w-3");
+  assert.ok(again?.input, JSON.stringify(again));
+  const snap = snapshotOf(host.dir);
+  assert.deepEqual([...snap.tickets.keys()].filter((k) => k !== "main"), [ticketId], "same ticket reused");
+  assert.equal(snap.tickets.get(ticketId)!.goal, "# Goal\nShip the widget");
+  const assigned = [...snap.assignments.values()].filter((x) => x.status === "active");
+  assert.deepEqual(assigned.map((x) => x.ticketId), [ticketId]);
+});
+
+test("F10 fix: a new ticket's targetPaths exclude paths that appear only in candidate scopes", async () => {
+  const host = learningHost();
+  const envelope = `${CANDIDATES_OPEN}${JSON.stringify({
+    version: 1, goalId: "goal-scope",
+    candidates: [{ parentId: null, directionId: "d", mechanism: "m", change: "touch src/scope-only.ts now", scope: ["src/scope-only.ts"], prompt: "Do the widget" }],
+  })}</subagent-candidates>`;
+  const r = await dispatch(host, "task", taskInput({ context: `# Goal\nupdate src/goal.ts\n\n${envelope}` }), "scope-1");
+  assert.ok(r?.input);
+  const ticket = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!;
+  assert.deepEqual(ticket.targetPaths, [normalizePathKey("src/goal.ts")]);
+  assert.equal(ticket.targetPaths.some((p) => p.includes("scope-only")), false);
+  assert.equal(ticket.goal.includes(CANDIDATES_OPEN), false);
+});
+
+// ── Task 11 fix round 2 ──
+
+test("F10 fix 2: learning failure on an existing ticket restores its targetPaths", async () => {
+  const host = learningHost();
+  const goalText = "# Goal\nupdate src/kept.ts\n\n";
+  const first = await dispatch(host, "task", taskInput({ context: goalText + envelopeTag("goal-tp", ["first prompt"]) }), "tp-1");
+  assert.ok(first?.input);
+  const before = [...snapshotOf(host.dir).tickets.values()].find((t) => t.ticketId !== "main")!;
+  const beforeTargets = [...before.targetPaths];
+  assert.ok(getSkillTelemetryStore(host.dir));
+  const db = new DatabaseSync(join(host.dir, ".omp", "harness", "skill-telemetry.db"));
+  try {
+    const row = db.prepare("SELECT payload_json p FROM learning_state WHERE id=1").get() as { p: string };
+    const st = JSON.parse(row.p);
+    st.cooldowns[directionArmId("goal-tp-cool", null, "dir-0")] = { excludedThroughOpportunity: 100, failures: 1 };
+    db.prepare("UPDATE learning_state SET payload_json=? WHERE id=1").run(JSON.stringify(st));
+  } finally {
+    db.close();
+  }
+  const failed = await dispatch(
+    host,
+    "task",
+    taskInput({ context: goalText + envelopeTag("goal-tp-cool"), allowedPaths: ["src/failed-only.ts"] }),
+    "tp-2",
+  );
+  assert.equal(failed?.block, true);
+  assert.match(String(failed?.reason), /excluded by cooldown/);
+  const after = snapshotOf(host.dir).tickets.get(before.ticketId)!;
+  assert.deepEqual(after.targetPaths, beforeTargets);
+  assert.equal(after.targetPaths.some((p) => p.includes("failed-only")), false);
+  assert.equal(after.allowedPaths.some((p) => p.includes("failed-only")), false);
+});
+
+// ── Task 12: startup drain and legacy regression ──
+
+function spyDrain(dir: string, impl?: () => void): { calls: () => number } {
+  const store = getSkillTelemetryStore(dir)!;
+  assert.ok(store);
+  let n = 0;
+  store.drainPending = () => { n += 1; impl?.(); };
+  return { calls: () => n };
+}
+
+test("startup drain runs for parent only and does not throw on failure", async () => {
+  const host = learningHost();
+  const spy = spyDrain(host.dir);
+  await fire(host.pi, "session_start", {}, host.ctx);
+  assert.equal(spy.calls(), 1, "parent session_start drains once");
+  await fire(host.pi, "session_start", {}, { ...host.ctx, agent: { kind: "sub" } });
+  assert.equal(spy.calls(), 1, "sub session_start never drains");
+
+  await withHarnessLog(async (logFile) => {
+    const h2 = learningHost();
+    const spy2 = spyDrain(h2.dir, () => {
+      throw Object.assign(new Error("PROJECTION_PENDING: secret-payload-xyz"), { code: "PROJECTION_PENDING" });
+    });
+    await assert.doesNotReject(async () => { await fire(h2.pi, "session_start", {}, h2.ctx); });
+    assert.equal(spy2.calls(), 1);
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /PROJECTION_PENDING/);
+    assert.equal(log.includes("secret-payload-xyz"), false, "diagnostic carries the code, not payload text");
+  });
+});
+
+test("startup drain fix: absent DB creates nothing and logs STORE_ABSENT", async () => {
+  await withHarnessLog(async (logFile) => {
+    const host = learningHost();
+    await fire(host.pi, "session_start", {}, host.ctx);
+    assert.equal(existsSync(join(host.dir, ".omp", "harness", "skill-telemetry.db")), false);
+    assert.match(readFileSync(logFile, "utf8"), /W2 .*k=39 tl=session_start code=STORE_ABSENT/);
+  });
+});
+
+test("startup drain fix: non-absolute cwd logs CWD_NOT_ABSOLUTE without the cwd value", async () => {
+  await withHarnessLog(async (logFile) => {
+    const pi = fakePi();
+    mount(pi);
+    await fire(pi, "session_start", {}, fakeCtx("relative-secret-dir"));
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /k=39 tl=session_start code=CWD_NOT_ABSOLUTE/);
+    assert.equal(log.includes("relative-secret-dir"), false);
+  });
+});
+
+test("startup drain fix: resume path drains once and logs STORE_UNAVAILABLE on a null store", async () => {
+  const host = learningHost();
+  const spy = spyDrain(host.dir);
+  await fire(host.pi, "session_start", { reason: "resume" }, host.ctx);
+  assert.equal(spy.calls(), 1, "resume drains once");
+
+  await withHarnessLog(async (logFile) => {
+    const h2 = learningHost();
+    // A directory at the DB path exists but cannot be opened, so the store is null.
+    mkdirSync(join(h2.dir, ".omp", "harness", "skill-telemetry.db"), { recursive: true });
+    const origError = console.error;
+    console.error = () => {};
+    try {
+      await assert.doesNotReject(async () => { await fire(h2.pi, "session_start", { reason: "resume" }, h2.ctx); });
+    } finally {
+      console.error = origError;
+    }
+    assert.match(readFileSync(logFile, "utf8"), /k=39 tl=session_start code=STORE_UNAVAILABLE/);
+  });
+});
+
+test("legacy dispatch is not blocked by pending outbox and creates no trace", async () => {
+  const host = learningHost();
+  assert.ok(getSkillTelemetryStore(host.dir));
+  const dbPath = join(host.dir, ".omp", "harness", "skill-telemetry.db");
+  const read = (): { traces: number; gen: number } => {
+    const db = new DatabaseSync(dbPath);
+    try {
+      const traces = Number((db.prepare("SELECT COUNT(*) c FROM dispatch_traces").get() as { c: number }).c);
+      const gen = Number((db.prepare("SELECT generation g FROM learning_state WHERE id=1").get() as { g: number }).g);
+      return { traces, gen };
+    } finally {
+      db.close();
+    }
+  };
+  const db = new DatabaseSync(dbPath);
+  try {
+    const pending = { dispatchId: "pending-1", sessionId: "s", outcome: { status: "pending", generation: 1, operationId: "op-1", destination: join(host.dir, "nowhere", "o.json"), outcomeJson: "{}" } };
+    db.prepare("INSERT INTO dispatch_traces(dispatch_id, payload_json, created_at) VALUES (?,?,?)").run("pending-1", JSON.stringify(pending), 1);
+  } finally {
+    db.close();
+  }
+  const before = read();
+  const r = await dispatch(host, "task", batchInput([{ assignment: "edit src/legacy.ts" }]), "legacy-1");
+  assert.notEqual(r?.block, true, JSON.stringify(r));
+  assert.deepEqual(read(), before, "no trace row and no generation change");
 });
