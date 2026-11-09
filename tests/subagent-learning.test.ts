@@ -8,7 +8,7 @@ import { join } from "node:path";
 import {
   SkillTelemetryStore, getSkillTelemetryStore, closeSkillTelemetryStores,
   parentArmId, directionArmId, dispatchId, observationId, failureKey,
-  normalizeScope, validateCandidateEnvelope, hashId,
+  normalizeScope, validateCandidateEnvelope, hashId, klUcbIndex,
 } from "../src/skill-telemetry.ts";
 
 function tempCwd(): string { return mkdtempSync(join(tmpdir(), "learn-")); }
@@ -195,4 +195,14 @@ test("validation returns normalized scope and trimmed IDs", () => {
 test("prompt containing a closing envelope tag still validates as data", () => {
   const env = withPrompt(okEnvelope, "see </subagent-candidates> here");
   assert.doesNotThrow(() => validateCandidateEnvelope(env));
+});
+
+test("F2: KL-UCB values and domain checks", () => {
+  assert.ok(Math.abs(klUcbIndex(0, 1, 1) - 0.704692) < 1e-5);
+  assert.equal(klUcbIndex(1, 1, 1), 1);
+  assert.equal(klUcbIndex(0, 0, 0), 1);
+  for (const [s, n, T] of [[2, 0, 5], [0, 2, 1], [Number.NaN, 1, 1], [1, Number.POSITIVE_INFINITY, 2], [-1, 1, 1], [0.5, 1, 1]] as const) {
+    assert.throws(() => klUcbIndex(s as number, n as number, T as number), RangeError);
+  }
+  assert.ok(klUcbIndex(8, 10, 20) > klUcbIndex(2, 10, 20));
 });

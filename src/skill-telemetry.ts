@@ -459,3 +459,31 @@ export function validateCandidateEnvelope(raw: unknown): CandidateEnvelope {
   });
   return { version: 1, goalId, candidates };
 }
+
+export function klUcbIndex(
+  successes: number, n: number, T: number,
+  c = 1, tolerance = 1e-8, maxIterations = 100,
+): number {
+  if (!Number.isSafeInteger(successes) || !Number.isSafeInteger(n) ||
+      !Number.isSafeInteger(T) || n < 0 || successes < 0 || successes > n || T < n) {
+    throw new RangeError("invalid counts: require 0 <= successes <= n <= T");
+  }
+  if (!Number.isFinite(c) || c < 0 || !Number.isFinite(tolerance) || tolerance <= 0 ||
+      !Number.isSafeInteger(maxIterations) || maxIterations < 1) {
+    throw new RangeError("invalid solver parameters");
+  }
+  if (n === 0) return 1;
+  const p = successes / n;
+  if (p === 1) return 1;
+  const budget = Math.log1p(T) + c * Math.log1p(Math.log1p(T));
+  const kl = (q: number): number =>
+    (p > 0 ? p * Math.log(p / q) : 0) + (1 - p) * Math.log((1 - p) / (1 - q));
+  let low = p;
+  let high = 1;
+  for (let i = 0; i < maxIterations && high - low > tolerance; i += 1) {
+    const mid = (low + high) / 2;
+    if (n * kl(mid) <= budget) low = mid;
+    else high = mid;
+  }
+  return low;
+}
