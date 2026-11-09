@@ -108,6 +108,8 @@ export function recordVerification(state: GateState, isError = false): void {
   // not mark the mutations as verified, so the gate keeps nagging.
   if (!isError) {
     state.verifications = state.mutations;
+    // v2: only non-doc mutations made after this passing check count again.
+    state.nonDocMutation = false;
   }
   state.lastCheckPassed = !isError;
   state.lastCheckError = Boolean(isError);

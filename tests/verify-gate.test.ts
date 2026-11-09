@@ -352,7 +352,7 @@ test("/harness-lesson on sets OMP_HARNESS_LESSON_GATE=1, off sets it to 0", asyn
 });
 
 // ---- verify-gate v2 (flag harness.verifyGate.v2) ----
-import { mkdirSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpDir } from "./_fake-pi.ts";
 import { isDocPath, readVerifyCommands } from "../src/verify-gate.ts";
@@ -415,6 +415,16 @@ test("v2 on: docs-only mutations do not block", async () => {
   const ctx = fakeCtx(projectWith({ test: "node --test" }));
   await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
   await fire(pi.handlers, "tool_result", { toolName: "edit", isError: false, input: { path: "notes.txt" } }, ctx);
+  assert.equal(await stop(pi, ctx), undefined);
+});
+
+test("v2 on: a docs-only edit after a passing check does not block", async () => {
+  const pi = fakePi();
+  mount(pi, { v2: true });
+  const ctx = fakeCtx(projectWith({ test: "node --test" }));
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "src/a.ts" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "bash", isError: false, input: { command: "node --test" } }, ctx);
+  await fire(pi.handlers, "tool_result", { toolName: "write", isError: false, input: { path: "README.md" } }, ctx);
   assert.equal(await stop(pi, ctx), undefined);
 });
 
