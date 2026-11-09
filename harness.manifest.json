@@ -28,6 +28,7 @@
     "src/memory.ts": "d89fa51463336a37cbc30fd5a61df8df9f87d26683fc42c56d56579adb493e50",
     "src/policy.ts": "63ce931141dc9e06451dbda961c5e4a9e51153d7c79a5cf21571631a55f7ca7b",
     "src/read-budget.ts": "894a48aef12c2f33e77a2792d8a1827e526780b62059e0c679b1e9ff9bdc8b1e",
+    "src/session-metrics.ts": "5108e3e9cf4d5a308eed7cd09808dee883f49dd697f2f274a05fc68a20fb131e",
     "src/skill-specs.ts": "bcf303a34e405d9b70fd356fbe98cefb5483b52c5bfd975af4de734be1537e7c",
     "src/skill-telemetry.ts": "b4b3443095b9cd342de6764aec019a3879cfdf50774834a93089d73968d8c67f",
     "src/stack-router.ts": "cdfd6a8d0d9649ef9d6ac91e72d23025acba211a9ad3e858a8d86f40832536f5",
@@ -47,7 +48,7 @@
     "skills/product-delivery/SKILL.md": "d85d406556439b3ba029f3a0bb4cfa4044ba1185e1e3cc36692657e69994f3fc",
     "skills/task-intake/SKILL.md": "436f622ef1cbe4674ffbeb9c16ba0eea647d94eb030e915b688874925be64af0",
     "py/zero_mem_bridge.py": "c2fc9fbb9bf738897390136f79fd8b1dad8949faa3229a01478b2bc55842d724",
-    "package.json": "b48ae8771040556f443bbfb4934311679181bd77ef51768f13ceaa384cc39c08"
+    "package.json": "5a2ac21d5458ec56b33d88ee856ba70630f6050ea66cd69c157a1472e32e61e3"
   },
   "migrations": []
 }
