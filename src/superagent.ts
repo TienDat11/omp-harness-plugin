@@ -16,6 +16,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { normalizePathKey, logHarnessCode, writeTextFileAtomic } from "./state.ts";
+import { extractCodeEntities } from "./zeromem.ts";
+import { checkOntologyCoverage, formatOntologyBrief } from "./ontology.ts";
 import { classifyVerifyCommand, isMutatingTaskCall, READ_ONLY_AGENTS } from "./verify-gate.ts";
 import {
   canonicalValue,
@@ -688,7 +690,7 @@ function checkMemoryContext(mc: SuperagentMemoryContext): void {
 }
 
 /**
- * Add the static contract when missing, then upsert the own memory block:
+ * Add the static contract when missing, then upsert the own policy-memory block:
  * same block → byte-identical; different revision → replace the own block only.
  */
 function applyLearningBlocks(text: string, mc: SuperagentMemoryContext, contractElsewhere: boolean): string {
@@ -741,26 +743,167 @@ function resolveLearningTaskInput(
   return next;
 }
 
-/**
- * Inject the static worker contract (legacy) or, with an internal memory
- * context (learning branch), the contract plus the own policy-memory block.
- * The learning form throws on malformed or duplicate own tags.
- */
+export type ComputeTier = "T1_MECHANICAL" | "T2_STANDARD" | "T3_DEEP_REASONING" | "T4_PREMIER";
+
+export interface TaskComplexityVector {
+  tokenEstimate: number;
+  codeEntityCount: number;
+  crossModuleSpread: number;
+  ontologyCoverage: number;
+  reversibilityRisk: number;
+  ambiguityScore: number;
+  recommendedTier: ComputeTier;
+  recommendedModel: string;
+  maxToolCallsBudget: number;
+  reason: string;
+}
+
+/** Structural signals preferred over prompt length: risk and ambiguity are not size. */
+const REVERSIBILITY_RISK_RE =
+  /\b(migrat(?:e|ion)|schema|drop\s+table|delete|auth(?:entication|orization)?|credential|secret|public\s+api|breaking\s+change)\b/i;
+const AMBIGUITY_RE = /\b(tbd|unknown|maybe|figure\s+out|investigate\s+why|open\s+question)\b/i;
+const PLAN_INVOCATION_RE = /\b\/plan\b/i;
+
+const TIER_BUDGETS: Record<ComputeTier, { model: string; budget: number }> = {
+  T1_MECHANICAL: { model: "ramclouds/glm-5.3-flash:max", budget: 12 },
+  T2_STANDARD: { model: "ns24/deepseek-v4.1-flash:high", budget: 18 },
+  T3_DEEP_REASONING: { model: "ns24/deepseek-v4.1-flash:max", budget: 24 },
+  T4_PREMIER: { model: "openai-codex/gpt-6-luna:max", budget: 24 },
+};
+
+const DEEP_AGENTS: Record<string, true> = {
+  architect: true, reviewer: true, "security-reviewer": true, "plan-reviewer": true,
+  "harness-proposer": true, "session-orchestrator": true,
+};
+const STANDARD_AGENTS: Record<string, true> = { debugger: true, "plan-drafter": true };
+
+const TIER_ORDER: ComputeTier[] = ["T1_MECHANICAL", "T2_STANDARD", "T3_DEEP_REASONING", "T4_PREMIER"];
+
+export function computeTaskComplexity(
+  taskText: string,
+  opts: {
+    agent?: string;
+    cwd?: string;
+    ontologyCoverage?: number;
+    reversibilityRisk?: number;
+    ambiguityScore?: number;
+    degradedRetries?: number;
+  } = {},
+): TaskComplexityVector {
+  const text = taskText ?? "";
+  const tokenEstimate = Math.ceil(text.length / 4);
+  const targetPaths = extractTargetPaths(text);
+  const codeEntities = extractCodeEntities(text);
+  const codeEntityCount = new Set([...targetPaths, ...codeEntities.files, ...codeEntities.symbols]).size;
+  const crossModuleSpread = new Set(
+    targetPaths.map((p) => p.replace(/\\/g, "/").split("/").slice(0, 2).join("/")),
+  ).size;
+  const ontologyCoverage =
+    opts.ontologyCoverage ?? (opts.cwd ? checkOntologyCoverage(opts.cwd, text).coverage : 1);
+  const reversibilityRisk = opts.reversibilityRisk ?? (REVERSIBILITY_RISK_RE.test(text) ? 0.75 : 0.1);
+  const ambiguityScore =
+    opts.ambiguityScore ??
+    Number(Math.min(1, Math.max(0, (1 - ontologyCoverage) * 0.6 + (AMBIGUITY_RE.test(text) ? 0.25 : 0))).toFixed(2));
+
+  let tier: ComputeTier;
+  let reason: string;
+  if (PLAN_INVOCATION_RE.test(text) || opts.agent === "advisor") {
+    tier = "T4_PREMIER";
+    reason = "premier-advisor";
+  } else if ((opts.agent !== undefined && DEEP_AGENTS[opts.agent] === true) || ambiguityScore > 0.35 || reversibilityRisk >= 0.5) {
+    tier = "T3_DEEP_REASONING";
+    reason = "deep-reasoning-or-risk";
+  } else if (crossModuleSpread >= 3 || (opts.agent !== undefined && STANDARD_AGENTS[opts.agent] === true)) {
+    tier = "T2_STANDARD";
+    reason = "cross-module-or-standard";
+  } else {
+    tier = "T1_MECHANICAL";
+    reason = "mechanical-bounded";
+  }
+
+  const retries = opts.degradedRetries ?? 0;
+  if (retries >= 2) {
+    const idx = TIER_ORDER.indexOf(tier);
+    tier = TIER_ORDER[Math.min(TIER_ORDER.length - 1, idx + 1)];
+    reason = `${reason}:escalated`;
+  }
+
+  const budget = TIER_BUDGETS[tier];
+  return {
+    tokenEstimate,
+    codeEntityCount,
+    crossModuleSpread,
+    ontologyCoverage,
+    reversibilityRisk,
+    ambiguityScore,
+    recommendedTier: tier,
+    recommendedModel: budget.model,
+    maxToolCallsBudget: budget.budget,
+    reason,
+  };
+}
+
+function buildPacketEnrichment(taskText: string, cwd: string, agent?: string): string {
+  const trimmed = taskText.trim();
+  if (trimmed === "") return "";
+  let coverage;
+  try {
+    coverage = checkOntologyCoverage(cwd, trimmed);
+  } catch {
+    return "";
+  }
+  const vec = computeTaskComplexity(trimmed, {
+    agent,
+    ontologyCoverage: coverage.coverage,
+  });
+  const parts: string[] = [];
+  const hasOntologySignal = coverage.matchedTerms.length > 0 || coverage.uncoveredEntities.length > 0;
+  if (hasOntologySignal) parts.push(formatOntologyBrief(coverage, 1200));
+  parts.push(
+    `<compute-budget tier="${vec.recommendedTier}" model="${vec.recommendedModel}" max_tool_calls="${vec.maxToolCallsBudget}" ontology_coverage="${coverage.coverage}">`,
+  );
+  parts.push(`<output-grammar tags="ready|blocked|failed">`);
+  return parts.join("\n");
+}
+
+/** Worker packets carry # Target/# Change/# Acceptance sections (or already hold the contract tag). */
+const WORKER_PACKET_RE = /^\s*#\s*(Target|Change|Acceptance)\b/im;
+
+function isWorkerPacket(text: string): boolean {
+  return WORKER_PACKET_RE.test(text) || text.includes(GOLDFISH_CONTRACT_TAG);
+}
+
 export function resolveSuperagentTaskInput(
   input: Record<string, unknown>,
   state?: SuperagentState,
-  memoryContext?: SuperagentMemoryContext | readonly SuperagentMemoryContext[],
+  third?: number | SuperagentMemoryContext | readonly SuperagentMemoryContext[],
+  cwd?: string,
 ): Record<string, unknown> | undefined {
-  if (memoryContext !== undefined) return resolveLearningTaskInput(input, memoryContext);
+  // Upstream learning branch passes a memory context as the third argument;
+  // our router passes a `now` timestamp. Discriminate by type.
+  if (third !== undefined && typeof third !== "number") {
+    return resolveLearningTaskInput(input, third);
+  }
   const tag = GOLDFISH_CONTRACT_TAG;
   const block = GOLDFISH_CONTRACT_BLOCK;
+  const now: number = typeof third === "number" ? third : DEFAULT_NOW();
 
   const context = typeof input.context === "string" ? input.context : "";
   if (context.includes(tag)) return undefined;
 
+  /** Contract + optional ontology/budget/grammar blocks, in that order. */
+  const appendBlocks = (text: string, agent?: string): string => {
+    const base = text === "" ? block : `${text}\n\n${block}`;
+    if (!cwd || !isWorkerPacket(text)) return base;
+    const enrichment = buildPacketEnrichment(text, cwd, agent);
+    return enrichment === "" ? base : `${base}\n\n${enrichment}`;
+  };
+
   const next: Record<string, unknown> = { ...input };
+  void now;
+  void state;
   if (typeof input.context === "string") {
-    next.context = context === "" ? block : `${context}\n\n${block}`;
+    next.context = appendBlocks(context);
     return next;
   }
   const tasks = Array.isArray(input.tasks) ? input.tasks : undefined;
@@ -774,14 +917,15 @@ export function resolveSuperagentTaskInput(
       const taskField = typeof tCopy.task === "string" ? tCopy.task : "";
       const assignment = typeof tCopy.assignment === "string" ? tCopy.assignment : "";
       const description = typeof tCopy.description === "string" ? tCopy.description : "";
+      const agent = typeof tCopy.agent === "string" ? tCopy.agent : undefined;
       const target = taskField || assignment || description;
       if (target.includes(tag)) continue;
       if (taskField !== "") {
-        tCopy.task = `${taskField}\n\n${block}`;
+        tCopy.task = appendBlocks(taskField, agent);
       } else if (assignment !== "") {
-        tCopy.assignment = assignment === "" ? block : `${assignment}\n\n${block}`;
+        tCopy.assignment = appendBlocks(assignment, agent);
       } else if (description !== "") {
-        tCopy.description = description === "" ? block : `${description}\n\n${block}`;
+        tCopy.description = appendBlocks(description, agent);
       }
       updatedTasks[i] = tCopy;
       changed = true;
@@ -1521,7 +1665,7 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
       field: plan.targets[k].field,
     }));
     if (toolName === "task") {
-      const final = resolveSuperagentTaskInput(replaced, state, plan.batch ? contexts : contexts[0])!;
+      const final = resolveLearningTaskInput(replaced, plan.batch ? contexts : contexts[0]);
       return { replaced, final, prompts };
     }
     const field = plan.targets[0].field;
@@ -1657,14 +1801,13 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
       const tasks = Array.isArray(scanInput.tasks) ? scanInput.tasks : undefined;
       if (tasks && tasks.length > 0) {
         for (const t of tasks) {
-          if (t && typeof t === "object") {
-            const tc = t as Record<string, unknown>;
-            const assignment = typeof tc.assignment === "string" ? tc.assignment : "";
-            const description = typeof tc.description === "string" ? tc.description : "";
-            const taskPaths = extractTargetPaths(assignment || description);
-            for (const p of taskPaths) {
-              if (!paths.includes(p)) paths.push(p);
-            }
+          if (t && typeof t !== "object") continue;
+          const tc = t as Record<string, unknown>;
+          const assignment = typeof tc.assignment === "string" ? tc.assignment : "";
+          const description = typeof tc.description === "string" ? tc.description : "";
+          const taskPaths = extractTargetPaths(assignment || description);
+          for (const p of taskPaths) {
+            if (!paths.includes(p)) paths.push(p);
           }
         }
       }
@@ -1713,14 +1856,9 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
       }
       if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
       if (learning.kind === "dispatch" && identity !== undefined) {
+        let out: { replaced: Record<string, unknown>; final: Record<string, unknown>; prompts: string[] };
         try {
-          const out = runLearningDispatch(toolName, input, learning, identity, cwd, ticket.ticketId, state);
-          const selectedPaths = out.prompts.flatMap((p) => extractTargetPaths(p));
-          if (selectedPaths.length > 0 && isMutatingTaskCall(input)) {
-            bindMainTicketPaths(state, selectedPaths, now());
-            if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
-          }
-          return { input: out.final };
+          out = runLearningDispatch(toolName, input, learning, identity, cwd, ticket.ticketId, state);
         } catch (err) {
           // Nothing is dispatched: release the tracked call, drop the assignment,
           // restore the ticket (a new one becomes "blocked") and undo the main binding.
@@ -1744,8 +1882,9 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
           if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
           return learningBlock(toolName, err instanceof Error ? err.message : String(err));
         }
+        return { input: out.final };
       }
-      const updated = resolveSuperagentTaskInput(input, state);
+      const updated = resolveSuperagentTaskInput(input, state, now(), shouldPersist(rawCwd) ? cwd : undefined);
       if (updated) return { input: updated };
     }
 

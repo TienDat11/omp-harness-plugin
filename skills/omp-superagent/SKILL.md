@@ -99,3 +99,17 @@ The prototype feeds the EGM (`egm-review-loop`) review cycle:
 
 - Does not edit `package.json`, `harness.manifest.json`, `src/verify-gate.ts`, `src/policy.ts`, `src/telemetry.ts`, or `src/tools.ts`.
 - Does not block `bash` unconditionally (breaks Tier-S and `src/verify-gate.ts`).
+
+## Injected packet blocks
+
+Three packet blocks are injected after `<superagent-worker-contract>` (only when
+a project `cwd` is available) and only once per call — the contract tag guard
+makes repeated calls idempotent:
+
+- `<ontology-context>` — output of `formatOntologyBrief`, capped at ~1200 chars.
+  Summarizes the project's ontology coverage and certified terms for the worker.
+- `<compute-budget tier="…" model="…" max_tool_calls="…" ontology_coverage="…">`
+  — declares the router tier, selected model, tool-call budget, and ontology
+  coverage score for the current task.
+- `<output-grammar tags="ready|blocked|failed">` — constrains the worker's
+  terminal report tag to one of `ready`, `blocked`, or `failed`.

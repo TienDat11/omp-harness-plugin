@@ -12,6 +12,7 @@ import {
   normalizeScope, canonicalValue, hashId,
   type Assessment, type CriterionSet, type ReportKind, type CommitBatchResult,
 } from "./skill-telemetry.ts";
+import { checkOntologyCoverage, certifyTermsForFiles, compileOntology, formatOntologyBrief } from "./ontology.ts";
 
 type Acceptance = { id: string; joint: string; check: string; pass: boolean; evidence: string; };
 type Outcome = { task: string; dir: string; tier: string; goal: string; acceptance: Acceptance[]; models: string[]; tokens: number; wall_ms: number; notes: string; sessionTelemetry?: SessionTotals; metrics?: SessionMetrics; recorded_at: string; };
@@ -537,6 +538,13 @@ export default function tools(pi: ExtensionAPI) {
       const body = lessonText ? `${base}\n\n${lessonText}` : base;
       const details: Record<string, unknown> = { file, failed };
       if (!lesson) details.lesson_cue = "Teach the user (1) why this design is right and (2) which look-alike cases must NOT use this design.";
+      if (failed === 0 && lesson?.files?.length) {
+        try {
+          certifyTermsForFiles(root, lesson.files, "harness_record");
+        } catch {
+          // Certification is advisory: never fail a recorded outcome.
+        }
+      }
       return { content: [{ type: "text" as const, text: body }], details };
     },
   });
@@ -735,6 +743,52 @@ export default function tools(pi: ExtensionAPI) {
           ...(answer.reason ? { reason: answer.reason } : {}),
         },
       };
+    },
+  });
+
+  pi.registerTool({
+    name: "ontology_check",
+    label: "Ontology: check entity coverage",
+    description: "Compute deterministic 0..1 entity coverage of a prompt or task against the project's compiled ontology (NVIDIA Auto-Ontology check_answerable equivalent).",
+    parameters: z.object({
+      query: z.string().describe("Prompt, task text, or question to score"),
+      cwd: z.string().optional().describe("Project root (defaults to session cwd)"),
+      certified_only: z.boolean().optional().describe("Only consider certified ontology terms"),
+      threshold: z.number().optional().describe("Answerability threshold, default 0.6"),
+    }),
+    approval: "read",
+    loadMode: "deferred",
+    strict: true,
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const root = path.resolve(params.cwd ?? (ctx as { cwd?: string } | undefined)?.cwd ?? process.cwd());
+      try {
+        if (checkOntologyCoverage(root, params.query).matchedTerms.length === 0) compileOntology(root);
+      } catch {
+        // Compilation is best-effort; the coverage gate degrades to "no terms".
+      }
+      const res = checkOntologyCoverage(root, params.query, {
+        threshold: params.threshold,
+        certifiedOnly: params.certified_only,
+      });
+      return { content: [{ type: "text" as const, text: formatOntologyBrief(res) }], details: res };
+    },
+  });
+
+  pi.registerTool({
+    name: "ontology_compile",
+    label: "Ontology: compile domain ontology",
+    description: "Run 2-pass structural and cross-file verified ontology compilation into Zero-Mem SQLite and optional Ossie YAML.",
+    parameters: z.object({
+      cwd: z.string().optional().describe("Project root (defaults to session cwd)"),
+      export_yaml: z.boolean().optional().describe("Also write .omp/ontology/domain-ontology.yaml, default true"),
+    }),
+    approval: "write",
+    loadMode: "deferred",
+    strict: true,
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const root = path.resolve(params.cwd ?? (ctx as { cwd?: string } | undefined)?.cwd ?? process.cwd());
+      const res = compileOntology(root, { exportYaml: params.export_yaml ?? true });
+      return { content: [{ type: "text" as const, text: JSON.stringify(res, null, 2) }], details: res };
     },
   });
 

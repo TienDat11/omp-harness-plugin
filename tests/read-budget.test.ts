@@ -384,6 +384,40 @@ test("R-01: folded ellipsis line in held read does not block a narrower sub-rang
   assert.equal(blocked?.block !== undefined, true, "exact repeat read must be blocked even with folded lines");
 });
 
+test("R-02: an over-wide repeat read is served as its uncovered tail instead of refused", () => {
+  const body = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join("\n");
+  const fixture = oneLiveRead("file.ts", "1-180", "[file.ts#AB12]", body);
+  // The guard narrows 1-400 to 1-180; that prefix is already in context, so the
+  // model would never receive 181-400. Serve the tail instead of blocking.
+  const verdict = evaluateRead("file.ts:1-400", fixture.cwd, fixture.branch);
+  assert.equal(verdict?.block, undefined);
+  assert.equal(verdict?.rewrite, `file.ts:181-${180 + MAX_READ_LINES}`);
+});
+
+test("R-02: the refusal names the file length and the next unread slice", () => {
+  const body = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join("\n");
+  const fixture = oneLiveRead("file.ts", "1-180", "[file.ts#AB12]", body);
+  const verdict = evaluateRead("file.ts:1-180", fixture.cwd, fixture.branch);
+  const block = String(verdict?.block);
+  assert.match(block, /already in context as \[file\.ts#AB12\]/);
+  assert.match(block, /The file has 400 lines\./);
+  assert.match(block, /read file\.ts:181-360 for the rest/);
+});
+
+test("R-02: a bare repeat read of a long file suggests an explicit slice", () => {
+  const body = Array.from({ length: 400 }, (_, i) => `line ${i + 1}`).join("\n");
+  const fixture = oneLiveRead("file.ts", undefined, "[file.ts#AB12]", body);
+  const block = String(evaluateRead("file.ts", fixture.cwd, fixture.branch)?.block);
+  assert.match(block, /The file has 400 lines\./);
+  assert.match(block, /e\.g\. file\.ts:181-360/);
+});
+
+test("R-02: a bare repeat read of a short file says the window reached the end", () => {
+  const fixture = oneLiveRead("file.ts", undefined, "[file.ts#AB12]", "a\nb\nc\n");
+  const block = String(evaluateRead("file.ts", fixture.cwd, fixture.branch)?.block);
+  assert.match(block, /The file has 3 lines\. That window reaches the end of the file\./);
+});
+
 test("R-01: resolveTaskInput injects parent-read-ledger into vibe_spawn.prompt", () => {
   const cwd = tmpDir();
   const file = path.join(cwd, "file.ts");

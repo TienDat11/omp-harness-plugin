@@ -82,6 +82,127 @@ Apply the documented settings overlay (`config/recommended.yml` covers task rout
 | `OMP_HARNESS_JEV_MODEL` | Overrides the Jev model name; must match what the endpoint reports or the call fails with `model-mismatch`. |
 | `OMP_HARNESS_REPO_SKILLS` | Adds repo-local skills to the router catalog. |
 
+#### Choosing a Jev route
+
+| Route | `TYPESAFE_BASE_URL` | Model | Probe file |
+|---|---|---|---|
+| Official TypeSafe | unset, or `https://api.typesafe.ai` | `jev-1.14.0` | none — the default host is trusted by identity (`src/decisions.ts:192`) |
+| `jev-latest` over ns24 | `https://api.ns24.io` | `jev-latest` | required, else `unavailable` / `no-passing-probe` (`src/decisions.ts:193-196`) |
+
+`TYPESAFE_API_KEY` carries the key of whichever gateway the base URL names. `OMP_HARNESS_JEV=1` is required for either route — Jev is off by default. `OMP_HARNESS_JEV_MODEL` only overrides the model name; it must match what the endpoint answers or the call fails with `model-mismatch`.
+
+#### Set the variables
+
+Windows — persist to the user environment, then open a new terminal before starting omp:
+
+```powershell
+setx OMP_HARNESS_JEV 1
+setx TYPESAFE_API_KEY "<your-key>"
+setx TYPESAFE_BASE_URL "https://api.ns24.io"   # omit this line for the official route
+```
+
+Windows — current session only (`$env:` values die with the shell):
+
+```powershell
+$env:OMP_HARNESS_JEV = "1"
+$env:TYPESAFE_API_KEY = "<your-key>"
+$env:TYPESAFE_BASE_URL = "https://api.ns24.io"   # omit for the official route
+```
+
+macOS / Linux — append to `~/.zshrc` or `~/.bashrc`, then `source` it and start a new omp session:
+
+```bash
+export OMP_HARNESS_JEV=1
+export TYPESAFE_API_KEY="<your-key>"
+export TYPESAFE_BASE_URL="https://api.ns24.io"   # omit for the official route
+```
+
+GitHub Codespaces — Settings → Secrets and variables → Codespaces: `TYPESAFE_API_KEY` as a secret, `OMP_HARNESS_JEV` and `TYPESAFE_BASE_URL` as variables, then rebuild the codespace so the environment is injected.
+
+GitHub Actions — Settings → Secrets and variables → Actions, mapped into the workflow that launches omp:
+
+```yaml
+env:
+  OMP_HARNESS_JEV: "1"
+  TYPESAFE_BASE_URL: https://api.ns24.io
+  TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+```
+
+#### Record the probe (non-default host only)
+
+`probes/` is local-only and gitignored, so a fresh clone has no probe record and an ns24 route starts unavailable. Run the probe once, then place the record where the decision layer reads it:
+
+```text
+/harness-decision probe        # inside the omp session: one synthetic round-trip
+```
+
+```bash
+# macOS / Linux
+mkdir -p <repo>/probes
+cp ~/.omp/harness/probes/jev-probe-api.ns24.io.json <repo>/probes/
+```
+
+```powershell
+# Windows PowerShell
+New-Item -ItemType Directory -Force <repo>\probes | Out-Null
+Copy-Item "$env:USERPROFILE\.omp\harness\probes\jev-probe-api.ns24.io.json" <repo>\probes\
+```
+
+The slash command writes under `~/.omp/harness/probes/` (`defaultProbesDir()`), while `expectedModelFor` reads the package's own `probes/` directory, so the copy is what unlocks the route. Equivalent by hand:
+
+```json
+{
+  "endpoint": "https://api.ns24.io",
+  "ok": true,
+  "requested": "jev-latest",
+  "model": "jev-latest",
+  "at": "2026-11-13T00:00:00.000Z"
+}
+```
+
+The official route needs no probe file.
+
+#### Check it
+
+`/harness-decision status` prints one fixed block. ns24 route with a recorded probe:
+
+```text
+harness-decision status
+  endpoint: api.ns24.io
+  expected-model: jev-latest
+  probe: passing 2026-10-26T00:45:23.393Z model=jev-latest
+  jev: on
+  egress: denied
+  receipt: none
+```
+
+Official route — `probe: none` is correct there, because that host is trusted without one:
+
+```text
+  endpoint: api.typesafe.ai
+  expected-model: jev-1.14.0
+  probe: none
+  jev: on
+  ...
+```
+
+`expected-model: unresolved (run probe)` means the ns24 probe record is missing or expired; `jev: off` means `OMP_HARNESS_JEV` did not reach the process. `/harness-decision probe` needs only `TYPESAFE_API_KEY` — it works with Jev off.
+
+Same check without the TUI (shell, Codespace, or a CI step):
+
+```bash
+node -e "import('./src/decisions.ts').then(m => { const e = m.jevEndpoint(); console.log('endpoint:', e, '| model:', m.expectedModelFor(e), '| enabled:', m.jevEnabled()); })"
+```
+
+Pass reads `endpoint: <host> | model: jev-latest | enabled: true`. `model: null` means the route is unlocked nowhere (missing probe record); `enabled: false` means `OMP_HARNESS_JEV` is not in this shell.
+
+| Check | Pass looks like |
+|---|---|
+| `harness_decide`, `kind: "readiness"` | Local, no network: returns a verdict (`go` / `needs-clarification` / `kill`) |
+| `harness_decide`, `kind: "intake"` | `status: "answered"`; an `unavailable` result names the gate (`OMP_HARNESS_JEV is not 1`, `no-passing-probe`, `model-mismatch`) |
+
+Egress note: `readiness` is evaluated locally; `intake`, `requirement` and `priority` send the complete supplied state to the endpoint named by `TYPESAFE_BASE_URL`.
+
 ### Repository layout
 
 ```text

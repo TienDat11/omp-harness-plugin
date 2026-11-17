@@ -7,9 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import path from "node:path";
-import MiniSearch from "minisearch";
-import Graph from "graphology";
-import pagerank from "graphology-metrics/centrality/pagerank.js";
+import { loadGraphology, loadMiniSearch } from "./optional-deps.ts";
 
 export const HARNESS_ROOT = fileURLToPath(new URL("..", import.meta.url));
 export const BRIDGE_SCRIPT = path.join(HARNESS_ROOT, "py", "zero_mem_bridge.py");
@@ -68,6 +66,8 @@ export interface QueryOptions {
   excludeSession?: string;
   excludeIds?: ReadonlySet<string>;
   includeInvalidated?: boolean;
+  /** Restrict evidence to memory units backed by a certified ontology term. */
+  certifiedOnly?: boolean;
 }
 
 export interface BridgeOptions {
@@ -131,6 +131,66 @@ export function storeExists(cwd: string): boolean {
 
 export function pythonPath(): string | null {
   return "node:sqlite";
+}
+
+const ONTOLOGY_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS ontology_terms (
+    term_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    description TEXT NOT NULL,
+    synonyms_json TEXT NOT NULL DEFAULT '[]',
+    physical_files_json TEXT NOT NULL DEFAULT '[]',
+    physical_symbols_json TEXT NOT NULL DEFAULT '[]',
+    certified INTEGER NOT NULL DEFAULT 0,
+    certified_by TEXT DEFAULT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_ontology_terms_name ON ontology_terms (name);
+  CREATE INDEX IF NOT EXISTS idx_ontology_terms_certified ON ontology_terms (certified);
+
+  CREATE TABLE IF NOT EXISTS ontology_relations (
+    src_term_id TEXT NOT NULL,
+    dst_term_id TEXT NOT NULL,
+    rel_kind TEXT NOT NULL,
+    evidence TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (src_term_id, dst_term_id, rel_kind)
+  );
+
+  CREATE TABLE IF NOT EXISTS ontology_queries (
+    query_id TEXT PRIMARY KEY,
+    term_id TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    command_or_sql TEXT NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL
+  );
+`;
+
+/** Idempotent ontology table registration; safe to call on every connection. */
+export function ensureOntologySchema(db: DatabaseSync): void {
+  db.exec(ONTOLOGY_SCHEMA_SQL);
+}
+
+const PRAGMAS = "PRAGMA journal_mode = WAL;\nPRAGMA synchronous = NORMAL;\nPRAGMA busy_timeout = 5000;";
+
+/**
+ * Run `fn` against a short-lived connection to the project memory DB.
+ * The handle is always closed, so Windows never leaks a `-wal` lock into a
+ * `rmSync` on the same directory.
+ */
+export function withMemoryDb<T>(cwd: string, fn: (db: DatabaseSync) => T): T {
+  const dbFile = dbPath(cwd);
+  mkdirSync(path.dirname(dbFile), { recursive: true });
+  const db = new DatabaseSync(dbFile);
+  try {
+    db.exec(PRAGMAS);
+    ensureOntologySchema(db);
+    return fn(db);
+  } finally {
+    db.close();
+  }
 }
 
 function normalizeText(raw: string): string {
@@ -477,6 +537,7 @@ export class ZeroMemBridge {
     db.exec(
       `CREATE TABLE IF NOT EXISTS memory_episodes (id TEXT PRIMARY KEY, request_head TEXT, outcome_tail TEXT, files_json TEXT, symbols_json TEXT, session_id TEXT, recorded_at TEXT);`,
     );
+    ensureOntologySchema(db);
     this.dbs.set(key, db);
     return db;
   }
@@ -614,6 +675,40 @@ export class ZeroMemBridge {
 
     const invalidFilter = includeInvalidated ? "" : "AND m.invalidated_at IS NULL";
 
+    // Certified facts: memory backed by a certified ontology term ranks higher and,
+    // with certifiedOnly, is the only evidence admitted.
+    const certifiedFiles = new Set<string>();
+    const certifiedSymbols = new Set<string>();
+    try {
+      const rows = db.prepare("SELECT physical_files_json, physical_symbols_json FROM ontology_terms WHERE certified = 1").all() as Array<{
+        physical_files_json: string;
+        physical_symbols_json: string;
+      }>;
+      for (const row of rows) {
+        for (const f of JSON.parse(row.physical_files_json || "[]") as string[]) {
+          if (typeof f !== "string" || !f) continue;
+          certifiedFiles.add(f.toLowerCase());
+          certifiedFiles.add(path.basename(f).toLowerCase());
+        }
+        for (const s of JSON.parse(row.physical_symbols_json || "[]") as string[]) {
+          if (typeof s === "string" && s) certifiedSymbols.add(s.toLowerCase());
+        }
+      }
+    } catch {
+      // no ontology tables yet: nothing is certified
+    }
+    const isCertifiedUnit = (files: string[], symbols: string[]): boolean => {
+      if (certifiedFiles.size === 0 && certifiedSymbols.size === 0) return false;
+      for (const f of files) {
+        if (typeof f !== "string" || !f) continue;
+        if (certifiedFiles.has(f.toLowerCase()) || certifiedFiles.has(path.basename(f).toLowerCase())) return true;
+      }
+      for (const s of symbols) {
+        if (typeof s === "string" && certifiedSymbols.has(s.toLowerCase())) return true;
+      }
+      return false;
+    };
+
     const candidateIds = new Set<string>();
     const ftsRankMap = new Map<string, number>();
     const msScoreMap = new Map<string, number>();
@@ -684,8 +779,9 @@ export class ZeroMemBridge {
       .prepare(`SELECT id, kind, text, l0, files_json, symbols_json, session_id, recorded_at, invalidated_at FROM memory_units ${includeInvalidated ? "" : "WHERE invalidated_at IS NULL"}`)
       .all() as Array<any>;
 
-    // 3. MiniSearch
+    // 3. MiniSearch (skipped when the package is absent: FTS5 + entity union still rank)
     try {
+      const MiniSearchCtor = loadMiniSearch(cwd);
       const docs = allRows
         .filter((r) => !excludeSession || r.session_id !== excludeSession)
         .filter((r) => !excludeIds || !excludeIds.has(r.id))
@@ -696,21 +792,23 @@ export class ZeroMemBridge {
           symbolsText: JSON.parse(r.symbols_json || "[]").join(" "),
           l0: r.l0,
         }));
-      const ms = new MiniSearch({
-        fields: ["text", "filesText", "symbolsText", "l0"],
-        storeFields: ["id"],
-        tokenize: tokenizeForFts,
-      });
-      ms.addAll(docs);
-      const msResults = ms.search(question, {
-        fields: ["text", "filesText", "symbolsText", "l0"],
-        boost: { symbolsText: 2.5, filesText: 2.5, l0: 1.5, text: 1.0 },
-        fuzzy: 0.2,
-        prefix: true,
-      });
-      for (const res of msResults.slice(0, topK * 8)) {
-        candidateIds.add(res.id);
-        msScoreMap.set(res.id, res.score);
+      if (MiniSearchCtor) {
+        const ms = new MiniSearchCtor({
+          fields: ["text", "filesText", "symbolsText", "l0"],
+          storeFields: ["id"],
+          tokenize: tokenizeForFts,
+        });
+        ms.addAll(docs);
+        const msResults = ms.search(question, {
+          fields: ["text", "filesText", "symbolsText", "l0"],
+          boost: { symbolsText: 2.5, filesText: 2.5, l0: 1.5, text: 1.0 },
+          fuzzy: 0.2,
+          prefix: true,
+        });
+        for (const res of msResults.slice(0, topK * 8)) {
+          candidateIds.add(res.id);
+          msScoreMap.set(res.id, Number(res.score));
+        }
       }
     } catch {
       // ignore
@@ -720,14 +818,15 @@ export class ZeroMemBridge {
     const rowMap = new Map<string, any>();
     for (const r of allRows) rowMap.set(r.id, r);
 
-    // 4. graphology pagerank
+    // 4. graphology pagerank (skipped when the package is absent; prBonus stays 0)
     const pagerankScores = new Map<string, number>();
     try {
-      const graph = new Graph({ type: "undirected", multi: false });
+      const graphDeps = loadGraphology(cwd);
       const candList = [...candidateIds];
+      const graph = graphDeps?.Graph ? new graphDeps.Graph({ type: "undirected", multi: false }) : null;
       for (const id of candList) {
         const r = rowMap.get(id);
-        if (!r) continue;
+        if (!r || !graph) continue;
         if (!graph.hasNode(id)) graph.addNode(id);
         const files = JSON.parse(r.files_json || "[]");
         const symbols = JSON.parse(r.symbols_json || "[]");
@@ -742,9 +841,11 @@ export class ZeroMemBridge {
           if (!graph.hasEdge(id, sn)) graph.addEdge(id, sn);
         }
       }
-      const pr = pagerank(graph, { alpha: 0.85 });
-      for (const id of candList) {
-        if (pr[id] !== undefined) pagerankScores.set(id, pr[id]);
+      if (graph && graphDeps) {
+        const pr = graphDeps.pagerank(graph, { alpha: 0.85 });
+        for (const id of candList) {
+          if (pr[id] !== undefined) pagerankScores.set(id, pr[id]);
+        }
       }
     } catch {
       // ignore
@@ -813,6 +914,10 @@ export class ZeroMemBridge {
       }
       if (stale) score *= 0.6;
 
+      const certified = isCertifiedUnit(files, symbols);
+      if (opts.certifiedOnly === true && !certified) continue;
+      if (certified) score *= 1.35;
+
       let text = r.text;
       if (!text.startsWith(`${r.kind}:`)) text = `${r.kind}: ${text}`;
 
@@ -841,8 +946,11 @@ export class ZeroMemBridge {
         let overlap = 0;
         for (const t of qTokens) if (uTokens.has(t)) overlap++;
         if (overlap === 0 && qTokens.size > 0 && !hasRecallCue && strippedTokens.length > 0) continue;
+        const certified = isCertifiedUnit(files, symbols);
+        if (opts.certifiedOnly === true && !certified) continue;
         let text = r.text;
         if (!text.startsWith(`${r.kind}:`)) text = `${r.kind}: ${text}`;
+        const baseScore = overlap > 0 ? 0.1 + overlap * 0.05 : 0.05;
         scored.push({
           id: r.id,
           kind: r.kind,
@@ -850,7 +958,7 @@ export class ZeroMemBridge {
           l0: r.l0,
           files,
           symbols,
-          score: Number((overlap > 0 ? 0.1 + overlap * 0.05 : 0.05).toFixed(4)),
+          score: Number((certified ? baseScore * 1.35 : baseScore).toFixed(4)),
         });
       }
     }

@@ -4,6 +4,7 @@ import { execFileSync } from "node:child_process";
 import path from "node:path";
 import crypto from "node:crypto";
 import os from "node:os";
+import { createRequire } from "node:module";
 
 const ROOT = path.resolve(path.dirname(process.argv[1] ?? "scripts/verify.mjs"), "..");
 const MANIFEST_PATH = path.join(ROOT, "harness.manifest.json");
@@ -27,6 +28,7 @@ const CHECK_IDS = [
   "decisions-separation",
   "agent-guidelines",
   "log-test-isolation",
+  "runtime-deps",
 ];
 
 function toPosix(p) {
@@ -634,6 +636,28 @@ function checkLogTestIsolation() {
   return { id: "log-test-isolation", ok: true, detail: "log test-isolation ok" };
 }
 
+function checkRuntimeDeps(pkg) {
+  const deps = Object.keys(pkg?.dependencies ?? {});
+  if (deps.length === 0) return { id: "runtime-deps", ok: true, detail: "no runtime dependencies declared" };
+  let req;
+  try {
+    req = createRequire(path.join(ROOT, "package.json"));
+  } catch (err) {
+    return { id: "runtime-deps", ok: false, detail: `could not create resolver: ${err && err.message ? err.message : String(err)}` };
+  }
+  const missing = [];
+  for (const dep of deps) {
+    try {
+      req.resolve(dep);
+    } catch {
+      missing.push(dep);
+    }
+  }
+  return missing.length === 0
+    ? { id: "runtime-deps", ok: true, detail: `all ${deps.length} runtime dependencies resolved` }
+    : { id: "runtime-deps", ok: false, detail: `missing runtime deps: ${missing.join(", ")}` };
+}
+
 function main() {
   let manifest;
   try {
@@ -666,6 +690,7 @@ function main() {
   results.push(checkDecisionsSeparation());
   results.push(checkAgentGuidelines());
   results.push(checkLogTestIsolation());
+  results.push(checkRuntimeDeps(pkg));
 
   const ordered = CHECK_IDS.map((id) => results.find((r) => r.id === id)).filter(Boolean);
 

@@ -26,6 +26,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { resolveAgentDir } from "./state.ts";
+import { compileOntology } from "./ontology.ts";
 import { extractUserPrompt } from "./skill-specs.ts";
 import { jevEnabled, judge, type JudgeDeps } from "./decisions.ts";
 import {
@@ -300,6 +301,13 @@ export default function memory(pi: ExtensionAPI, deps: MemoryDeps = {}) {
     void syncIndex(cwd).catch(() => {
       // A cold store must never fail the session.
     });
+    // Ontology compilation is bounded and off the hot path: it must never block
+    // startup or any tool_call.
+    Promise.resolve()
+      .then(() => compileOntology(cwd))
+      .catch(() => {
+        // A missing or unreadable tree must never fail the session.
+      });
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
