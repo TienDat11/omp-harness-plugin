@@ -15,7 +15,7 @@ import path from "node:path";
 import os from "node:os";
 import type { Dirent } from "node:fs";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-import MiniSearch from "minisearch";
+import { loadMiniSearch, type MiniSearchLike } from "./optional-deps.ts";
 import { getSuggestion, globalHarnessLogPath, logHarnessCode, resolveAgentDir, resolveUserHarnessDir, summarizeHarnessLog, writeTextFileAtomic } from "./state.ts";
 import { tokenizeForFts } from "./zeromem.ts";
 import {
@@ -197,6 +197,7 @@ function collectMarkers(cwd: string): string[] {
 const MAX_MARKER_BYTES = 64 * 1024;
 
 function readFileSafe(filePath: string): string {
+  if (!existsSync(filePath)) return "";
   try {
     const stat = statSync(filePath);
     if (!stat.isFile()) return "";
@@ -238,17 +239,86 @@ export function installedSkillsDir(homeDir = os.homedir()): string {
   return path.join(homeDir, ".omp", "agent", "skills");
 }
 
+export function discoverPluginSkillDirs(homeDir = os.homedir()): string[] {
+  const pluginsRoot = path.join(homeDir, ".omp", "plugins");
+  const candidates: string[] = [];
+
+  // a. installPath entries declared by installed_plugins.json
+  try {
+    const raw = readFileSync(path.join(pluginsRoot, "installed_plugins.json"), "utf8");
+    const parsed: unknown = JSON.parse(raw);
+    let pluginMap: Record<string, unknown> | undefined;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed) &&
+      "plugins" in parsed &&
+      (parsed as Record<string, unknown>).plugins !== null &&
+      typeof (parsed as Record<string, unknown>).plugins === "object" &&
+      !Array.isArray((parsed as Record<string, unknown>).plugins)
+    ) {
+      pluginMap = (parsed as Record<string, unknown>).plugins as Record<string, unknown>;
+    }
+    if (pluginMap) {
+      for (const name of Object.keys(pluginMap)) {
+        const list = pluginMap[name];
+        if (!Array.isArray(list)) continue;
+        for (const entry of list) {
+          if (entry === null || typeof entry !== "object" || Array.isArray(entry)) continue;
+          const installPath = (entry as Record<string, unknown>).installPath;
+          if (typeof installPath === "string") {
+            candidates.push(path.join(installPath, "skills"));
+          }
+        }
+      }
+    }
+  } catch {
+    // Missing or unreadable installed_plugins.json is not an error.
+  }
+
+  const addPluginDir = (dir: string): void => {
+    try {
+      for (const entry of [...readdirSync(dir)].sort()) {
+        candidates.push(path.join(dir, entry, "skills"));
+      }
+    } catch {
+      // Missing or unreadable plugin directory: skip.
+    }
+  };
+
+  // b. cache/plugins/*/skills
+  addPluginDir(path.join(pluginsRoot, "cache", "plugins"));
+  // c. src/*/skills
+  addPluginDir(path.join(pluginsRoot, "src"));
+  // d. node_modules/*/skills, skipping the scoped @local install and dotfiles
+  try {
+    for (const entry of [...readdirSync(path.join(pluginsRoot, "node_modules"))].sort()) {
+      if (entry === "@local" || entry.startsWith(".")) continue;
+      candidates.push(path.join(pluginsRoot, "node_modules", entry, "skills"));
+    }
+  } catch {
+    // Missing or unreadable node_modules: skip.
+  }
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const candidate of candidates) {
+    if (existsSync(candidate) && !seen.has(candidate)) {
+      seen.add(candidate);
+      out.push(candidate);
+    }
+  }
+  return out.sort();
+}
+
 export function installedSkillDirs(homeDir = os.homedir()): string[] {
   if (homeDir !== os.homedir()) {
     const roots: string[] = [
       path.join(homeDir, ".omp", "agent", "skills"),
       path.join(homeDir, ".omp", "plugins", "node_modules", "@local", "omp-adaptive-harness", "skills"),
     ];
-    const cachePluginsDir = path.join(homeDir, ".omp", "plugins", "cache", "plugins");
-    if (existsSync(cachePluginsDir)) {
-      for (const entry of [...readdirSync(cachePluginsDir)].sort()) {
-        roots.push(path.join(cachePluginsDir, entry, "skills"));
-      }
+    for (const dir of discoverPluginSkillDirs(homeDir)) {
+      roots.push(dir);
     }
     const seen = new Set<string>();
     const out: string[] = [];
@@ -282,11 +352,8 @@ function sortedSkillDirs(homeDir = os.homedir()): Array<{ dir: string; origin: S
   const agentDir = resolveAgentDir();
   push(agentDir ? path.join(agentDir, "skills") : path.join(homeDir, ".omp", "agent", "skills"), "user-global");
   push(path.join(homeDir, ".omp", "plugins", "node_modules", "@local", "omp-adaptive-harness", "skills"), "bundle");
-  const cachePluginsDir = path.join(homeDir, ".omp", "plugins", "cache", "plugins");
-  if (existsSync(cachePluginsDir)) {
-    for (const entry of [...readdirSync(cachePluginsDir)].sort()) {
-      push(path.join(cachePluginsDir, entry, "skills"), "plugin-cache");
-    }
+  for (const dir of discoverPluginSkillDirs(homeDir)) {
+    push(dir, "plugin-cache");
   }
   return out;
 }
@@ -517,7 +584,7 @@ function skillNotForExcluded(doc: SkillDoc, prompt: string): boolean {
   return false;
 }
 
-const miniSearchIndexCache = new WeakMap<SkillDoc[], MiniSearch>();
+const miniSearchIndexCache = new WeakMap<SkillDoc[], MiniSearchLike>();
 
 /**
  * Stage-1 funnel: MiniSearch recall over the skill catalog, unioned with the
@@ -534,9 +601,10 @@ export function selectCandidateDocs(
   const stack = new Set(opts?.stackSkills ?? []);
   const suggest = new Set(opts?.suggestionSkills ?? []);
   try {
+    const MiniSearchCtor = loadMiniSearch();
     let ms = miniSearchIndexCache.get(docs);
-    if (!ms) {
-      ms = new MiniSearch({
+    if (!ms && MiniSearchCtor) {
+      ms = new MiniSearchCtor({
         idField: "name",
         fields: ["name", "description"],
         tokenize: tokenizeForFts,
@@ -544,6 +612,12 @@ export function selectCandidateDocs(
       });
       ms.addAll(docs.map((d) => ({ name: d.name, description: d.description })));
       miniSearchIndexCache.set(docs, ms);
+    }
+    if (!ms) {
+      // Package absent: keep the stack/suggestion union, skip lexical recall.
+      const fallback = new Set<string>([...stack, ...suggest]);
+      if (fallback.size === 0) return docs;
+      return docs.filter((d) => fallback.has(d.name));
     }
     const results = ms.search(foldVietnamese(prompt), {
       fields: ["name", "description"],

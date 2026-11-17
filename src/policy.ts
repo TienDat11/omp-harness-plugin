@@ -226,6 +226,24 @@ function isGitPushCommand(command: string): boolean {
   return false;
 }
 
+/**
+ * Advisory telemetry for commands that dump unbounded output into the transcript.
+ * Never blocks: a large dump is a cost signal, not a safety problem.
+ */
+export function checkUnboundedBashDump(command: string): { warn: boolean; reason?: string } {
+  const cmd = (command ?? "").trim();
+  if (cmd === "") return { warn: false };
+  if (/\|\s*(?:head|tail|wc|grep|rg)\b/i.test(cmd)) return { warn: false };
+  if (/^\s*cat\s+\S+/i.test(cmd)) return { warn: true, reason: "unbounded-cat" };
+  if (/\bgit\s+log\b/i.test(cmd) && !/(?:-n\s*\d+|-\d+|--max-count|--oneline)\b/i.test(cmd)) {
+    return { warn: true, reason: "unbounded-git-log" };
+  }
+  if (/^\s*grep\s+-[a-zA-Z]*r[a-zA-Z]*\b/i.test(cmd) && !/\s(?:--max-count|-m)\b/i.test(cmd)) {
+    return { warn: true, reason: "unbounded-grep-r" };
+  }
+  return { warn: false };
+}
+
 export function evaluateBash(command: string, cwd: string): { block: boolean; reason?: string } {
   const segments = command
     .split(/[;|&\n\r]+/)
@@ -641,6 +659,10 @@ export default function policy(pi: ExtensionAPI): void {
       if (bash.block) {
         logHarnessCode(ctx.cwd, `G1 rc=22 tl=bash`);
         return { block: true, reason: bash.reason };
+      }
+      const dumpCheck = checkUnboundedBashDump(command);
+      if (dumpCheck.warn) {
+        logHarnessCode(ctx.cwd, `B1 tl=bash r=${dumpCheck.reason}`);
       }
     }
     return rewrittenInput ? { input: rewrittenInput } : undefined;

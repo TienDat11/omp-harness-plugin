@@ -17,7 +17,7 @@ description: Reference for this machine's omp harness — model roles, provider 
 `src/read-budget.ts` enforces three rules before `read` or `task` executes. None touch the system prompt or cached prefix.
 
 - **Cap.** An explicit range wider than 180 lines is rewritten to its first 180 lines; a whole-file `:raw` above 64 KiB becomes `1-180:raw`. The tool's own `[Showing lines 1-180 of N. Use :181 to continue]` footer tells the model where to resume. `read.defaultLimit: 180` makes a bare read match the same cap.
-- **Duplicate.** A read whose content is still live in the session is refused with the `[name#TAG]` anchor already held: `blocked: big.ts (lines 181-360) is already in context as [big.ts#B12D]; reuse it.`
+- **Duplicate.** A read whose content is still live in the session is refused with the `[name#TAG]` anchor already held: `blocked: big.ts (lines 181-360) is already in context as [big.ts#B12D]; reuse it.` Since `1.2.1` the refusal also states the file's line count and the next unread slice (`The file has 451 lines. Lines 181-451 are not in context; read big.ts:181-360 for the rest.`), and an over-wide repeat whose narrowed prefix is already held is served as its **uncovered tail** (`big.ts:1-400` → rewritten to `big.ts:181-360`) instead of refused. Measured 2026-11-09 against 104 duplicate-read refusals in three days of transcripts: weak models (`vilao/minimax-m3.1-flash`, `local-relay/north-mini-code`) retried the dead end instead of asking for the next slice.
 - **Subagent read-ledger handoff (`<parent-read-ledger>`).** Before a `task` call executes, `resolveTaskInput` collects up to 12 stat-verified live reads from the parent branch and appends `<parent-read-ledger>` (path, `[name#TAG]`, held window labels, and extracted top-level symbol `name@line` map for code files) to `task.context` (or `task.task` for single-task calls). All sibling subagents share the identical `context` block in their trailing user turn without mutating the static system prompt.
 
 "Live" means all of: same resolved path, same or covering range, `prunedAt` unset, after the latest `firstKeptEntryId` compaction boundary, file `mtimeMs`/`size` equal to the stat captured when the result arrived, and no later `edit`/`write`/`ast_edit` on that path. Any of those changing re-allows the read, so the guard fails open — including on a resumed session, which has no recorded stats. In-process subagent teardown (`session_shutdown` with `ctx.agent.kind === "sub"`) is ignored by `policy.ts`, `intake.ts`, and `memory.ts` so parent `readStats`, failure counters, Jev state, and the Zero-Mem bridge stay intact across subagent waves.
@@ -48,7 +48,7 @@ Measured, not guessed. Numbers below come from real sessions on 2026-10-19.
 Dead or unusable on this account (verified by probe):
 
 - `bai` — `credit insufficient balance: balance=0` on every model.
-- `ramclouds` — prepaid balance exhausted (`$0.000438` remaining).
+- `ramclouds` — was prepaid-exhausted on 2026-10-19 (`$0.000438` remaining); funded and serving again on 2026-11-09. Live list and probe results: §1c.
 - `novita` — `NOT_ENOUGH_BALANCE`.
 - `xpl` — requires $1 card verification.
 - `openai` — `Incorrect API key provided`.
@@ -101,6 +101,18 @@ Flat per-request billing changes the thinking-level calculus: a higher effort
 costs no extra money, only latency. `defaultLevel: medium` for the mechanical
 roles, not `high`.
 
+**2026-11-09: `/v1/models` advertises entitlements the key cannot use.** `GET /v1/models`
+lists six active rows — `minimax-m3.1-flash`, `glm-5.3-flash`, `zai-org/glm-5.3-flash`,
+`cl​aude-fable-5.1`, `cl​aude-opus-5-5`, `cl​aude-haiku-5-5` — but `POST /v1/messages`
+answers `200` only for the first three. `cl​aude-haiku-5-5`, the `bee-tok/` prefixed
+form of the same id, and `cl​aude-opus-5-5` all return
+`403 permission_error: "Please subscribe to model in the API Key"`, which is why the
+Nov 6-9 logs carry 18 such turn-killers. Treat the catalogue as a **list of candidates,
+not a capability statement**: probe the id with one `POST /v1/messages` before putting
+it in a role, and keep `modelRoles`/`compaction.modelThresholds` on ids that answered
+`200`. The two dead `modelThresholds` rows were removed from
+`~/.omp/agent/config.yml` on 2026-11-09.
+
 ## 1b. `north-mini-code` is a 9router combo (fixed 2026-10-23)
 The relay on `localhost:20128` is **9router** (global npm install; the
 `AppData/Roaming/npm` path is a symlink to `D:\DevCache\npm-global\node_modules\9router`).
@@ -123,10 +135,33 @@ The relay on `localhost:20128` is **9router** (global npm install; the
 
 **What was changed** (both must survive a 9router reinstall):
 
-- Combo row now: `openrouter/recursive/flint-v1.0:free`, `oc/mimo-v2.6-flash-free`,
-  `openrouter/xingchen-agi/xing4.0-29b-a4b:free`. All three verified for tool calls
-  and multi-turn tool results. Backup of the old rows:
-  `~/AppData/Roaming/9router/backups/omp-fix-*/combos.json`.
+- Combo row **2026-11-09**: `openrouter/recursive/flint-v1.0:free`,
+  `openrouter/cohere/north-mini-code:free`,
+  `openrouter/dots-studio/dots-3-note-preview:free`,
+  `openrouter/xingchen-agi/xing4.0-29b-a4b:free`, `oc/mimo-v2.6-flash-free`.
+  All five answered a `tools` + `tool_choice:"none"` request with `200`; flint,
+  cohere, dots and xing4.0 also emitted real `tool_calls`. Backup of every earlier
+  row: `~/AppData/Roaming/9router/backups/omp-fix-*/combos.json`. Members removed
+  that day, with the measured failure:
+  - `openrouter/stealth/crouton-alpha` — `400 Provider returned error` **only** when
+    the body carries `tool_choice:"none"` together with `tools`; the same body with
+    `tool_choice:"auto"` or no `tool_choice` returns `200`, and with a full token
+    budget it emits real `tool_calls`. omp sends `tool_choice:"none"` on no-tools
+    turns, so the failure is deterministic per turn type, not per request size. It
+    was the **first** member, so all 96 captured HTTP-400 bodies in
+    `~/.omp/logs/http-400-requests/` were this entry — every one
+    `local-relay/north-mini-code`, every one ≥ 544 KB / ≥ 393 messages.
+  - `openrouter/google/lyria-3-pro-preview`, `openrouter/thinkingmachines/inkling:free`,
+    `openrouter/thinkingmachines/inkling-small:free` — `404 No endpoints found` /
+    `This model is unavailable for free`.
+  - `oc/ling-3.1-flash-free` — `400 Model is unavailable` (documented 2026-10-23).
+  - `oc/mimo-v2.6-flash-free` answers `429 FreeUsageLimitError` once the daily free
+    cap is spent; keep it last rather than first.
+  - All kept members are reasoning models with high reasoning-token overhead:
+    `max_tokens: 200` returns `finish_reason:"length"` with `content: null` because
+    200-760 reasoning tokens are spent first. omp sends `max_completion_tokens:
+    16384`, which is enough; a harness/CLI that pins a small `max_tokens` through
+    this combo will see empty completions.
 - **Order = currently-usable first.** 9router does not skip a combo entry that is
   rate-limited, so an exhausted first entry costs a full round trip (~2.5-3 s) on
   every request before the next is tried. `oc/mimo-v2.6-flash-free` hit
@@ -146,20 +181,93 @@ The relay on `localhost:20128` is **9router** (global npm install; the
 - Vendored patch in
   `D:\DevCache\npm-global\node_modules\9router\app\.next-cli-build\server\chunks\8910.js`
   (module `18910`, the combo runner): the `if(!i)return …` guard became
-  `if(!i&&!([406,410].includes(b.status)||(400===b.status&&/unavailable|not found|deprecated|not supported|does not exist/i.test(String(f)))))return …`
-  so a dead combo entry is skipped. **Lost on `npm i -g 9router@…`** — re-apply, or
-  keep the combo list free of dead entries.
+  `if(!i&&!([406,410].includes(b.status)||(400===b.status&&/unavailable|not found|deprecated|not supported|does not exist|provider returned error/i.test(String(f)))))return …`
+  so a dead combo entry is skipped. `provider returned error` was added 2026-11-09
+  because that is the exact OpenRouter text for a broken upstream, and the previous
+  regex did not match it — one bad first member aborted the whole combo.
+  **Lost on `npm i -g 9router@…`** — re-apply, or keep the combo list free of dead entries.
 
 Restart: kill the server PID; the `cli.js` supervisor respawns it in a few seconds.
 DB combo edits apply without a restart; the chunk patch does not.
 
-Verification that matters: a combo with a `410` and a `400-unavailable` entry in front
-now returns `200` from the next entry, and a real tool-using subagent turn on
-`local-relay/north-mini-code` completes without a paid fallback. **Historical since
-2026-10-27** — nothing routes to the relay any more; kept because the 9router combo
-patch is still installed and still needs re-applying after `npm i -g 9router@…`.
+Verification that matters: the exact 544 KB, 393-message body that 400'd before now
+returns `200` through `north-mini-code` (served by `recursive/flint-v1.0`), and a real
+tool-using subagent turn on `local-relay/north-mini-code` completes without a paid
+fallback. **The relay is in use again** — 57 `model_change` entries and 96 captured
+400s across 2026-11-06..09 transcripts, so the "nothing routes to the relay" note of
+2026-10-27 no longer holds; keep this section current whenever the combo drifts.
 
-## 1c. Subagent routing (relay split verified 2026-10-23, vilao split 2026-10-27)
+## 1c. `ramclouds` — live again 2026-11-09, `glm-5.3-flash` is the subagent primary since 2026-11-10
+
+`GET https://ramclouds.me/v1/models` with `RAMCLOUDS_API_KEY` returned **12 ids**
+on 2026-11-09; the 25-id list recorded on 2026-09-13 is gone upstream:
+`deepseek-v4-flash`, `deepseek-v4-pro`, `glm-5.3`, `qwen-3.8-flash`, `qwen-3.8-max`,
+`MiniMax-M3`, the four `gemini-3.x-flash*`, `gpt-5.6-luna`, `grok-4.5`, `grok-4.6`,
+`grok-composer-2.5-fast`, `kimi-k2.7-code`, `kimi-k3`, `mimo-v2.5`,
+`grok-imagine-image-2.0`, `grok-imagine-image-edit` all answer 503/404 now.
+
+Live: `crouton-alpha`, `agnes-3.0-flash`, `deepseek-v4.1-flash`,
+`deepseek-v4.1-flash-1017`, `glm-5.3-flash`, `gpt-5.5-chat`, `gpt-6`, `mercury-3`,
+`laguna-s-2.1`, `laguna-xs-2.1`, `gpt-image-2`, `dall-e-3`.
+`~/.omp/agent/models.yml` was reconciled to exactly these 12 on 2026-11-09; the old
+"ramclouds does not serve deepseek-v4.1-flash" note is stale.
+
+**Wire caveats (probed 2026-11-09, this key):**
+- A bare `urllib`/`curl` User-Agent gets Cloudflare **1010** on
+  `/v1/chat/completions`; `/v1/models` answers either way. Send a browser UA when
+  probing by hand. omp is unaffected.
+- `crouton-alpha` resolves to upstream **`stealth/crouton-alpha`** (OpenRouter
+  provider "Stealth") and returns its own id, not `crouton-alpha`, in responses.
+- `tools` + `tool_choice:"auto"` → real `tool_calls` with streamed arguments.
+  A full assistant-tool_call → tool_result → answer loop completes.
+  **`tools` + `tool_choice:"none"` → 400 `Provider returned error`** — the same
+  stealth-upstream defect that removed it from the 9router combo (§1b).
+- It is a reasoning model: reasoning tokens are spent before content, so a small
+  `max_tokens` yields `content:null` + `finish_reason:"length"`. `reasoning:{effort}`
+  and `reasoning_effort` both accept low/high. omp line-probe with the full system
+  prompt: 48,821 input tokens accepted, 2 turns (one `bash` tool call) in 20 s;
+  a 4-message tool loop took 80.7 s — **latency, not correctness, is the risk.**
+- `contextWindow`/`maxTokens` are not in the gateway payload; every value in
+  `models.yml` is a conservative cap. `glm-5.3-flash` is declared 131072/16384, so
+  `compaction.modelThresholds["ramclouds/glm-5.3-flash"] = f104000` (80% of 131072)
+  and the subagent `agentCompactionThresholdOverrides` dropped 160000 → 104000 —
+  a 131K model behind a 160K ceiling hard-fails instead of compacting.
+  `crouton-alpha`'s 200K threshold row was retired with the routing.
+
+**Routing since 2026-11-10** (supersedes the split tables in §1d and §3 for
+subagents): `task.agentModelOverrides` for all 16 agents = `ramclouds/glm-5.3-flash:max`,
+`modelRoles.task` = `ramclouds/glm-5.3-flash:max`, and
+`retry.fallbackChains["ramclouds/glm-5.3-flash"] = [vilao/minimax-m3.1-flash:max]`.
+The pre-existing `fallbackChains.subagent` and `.default` entries already resolve to
+`vilao/minimax-m3.1-flash:max`, so a glm failure lands on minimax either way.
+`crouton-alpha` keeps its catalogue entry but is in no role.
+
+### Why `max` — measured obedience battery, 2026-11-10
+
+Six probes per level against `POST /v1/chat/completions` (browser UA, `tools` present,
+system prompt = "execute the spec literally, never explain"):
+
+|Probe|`low`|`high`|`max`|
+|---|---|---|---|
+|3 exact lines, no markdown|pass 2.6s|pass 3.0s|pass 8.3s|
+|exact tool args, 1 call|pass 2.8s|pass 6.3s|pass 5.6s|
+|"do not call a tool"|pass, 0 calls|pass, 0 calls|pass, 0 calls|
+|**main-agent instruction over system suffix**|**refused**|**refused**|**`GO\n\nSTOP`**|
+|one call when tempted twice|pass 11.1s|pass 8.8s|pass 2.0s|
+|exact `OK` after 25 lines of context|pass 3.3s|pass 6.0s|pass 2.3s|
+
+Only `max` followed the main agent's content instruction when the system prompt
+demanded a suffix — `low`/`high` answered "I can't ignore my instructions" and
+emitted the mandated token instead. Nothing regressed at `max`, and it was not
+slower overall. Consequence: pin `:max`, do not drop the level to save tokens.
+
+`glm-5.3-flash` has **none** of `crouton-alpha`'s wire defects: `tools` +
+`tool_choice:"none"` returns 200 (the body that 400s on crouton), a no-tools turn
+returns text, and a full `omp -p` tool loop completes in 26 s. It also self-identifies
+as "AutoClaw" and may add a greeting when the prompt is one word — harmless for
+spec-driven subagent work, confusing if a subagent answer is read verbatim.
+
+## 1d. Subagent routing (relay split verified 2026-10-23, vilao split 2026-10-27)
 
 `task.agentModelOverrides` beats `modelRoles.<role>`. Setting only
 `modelRoles.task: vilao/…` does nothing while
@@ -373,3 +481,64 @@ With `cost` set to `0` for these models, warming is effectively inert — the
 `vilao` is the one provider with non-zero `cost` rates (0.031285 USD/Mtok, §1a),
 but they are ~30x too low to reach the $0.05 warming threshold: a 200k-token
 prefix costs $0.0063 to re-send. Warming stays inert for every provider in use.
+
+## 6. Model role tiers
+
+| Tier | Selector | Budget | Role |
+|---|---|---|---|
+| `T1_MECHANICAL` | `ramclouds/glm-5.3-flash:max` | 12 | Subagent mechanical work — research, file reading, grading, coder, title generation |
+| `T2_STANDARD` | `ns24/deepseek-v4.1-flash:high` | 18 | Judgement work — review, security review, architect |
+| `T3_DEEP_REASONING` | `ns24/deepseek-v4.1-flash:max` | 24 | Complex reasoning — planning, deep analysis, hard agent overrides |
+| `T4_PREMIER` | `openai-codex/gpt-6-luna:max` | 24 | Premier — plan and advisor roles, complex code generation |
+
+`task.agentModelOverrides` beats `modelRoles.<role>`. Setting only
+`modelRoles.task` does nothing while `task.agentModelOverrides.task` names
+another model. `task.maxRecursionDepth: 1` — a subagent may not spawn its own
+children.
+
+## 7. Auto-Ontology layer
+
+The harness runs an Auto-Ontology pipeline on every project `cwd`:
+
+- `ontology_check` — scans the project for certified terms and computes ontology
+  coverage against the Zero-Mem SQLite DB from `dbPath(cwd)`.
+- `ontology_compile` — compiles discovered terms into `.omp/ontology/domain-ontology.yaml`
+  (Ossie YAML format).
+- **0..1 coverage gate** — default threshold `0.6`. Coverage below the gate
+  triggers deeper subagent analysis before routing.
+- **Certified terms** (`certified = 1`) receive a `1.35×` retrieval boost in
+  Zero-Mem unit scoring.
+- `certifiedOnly` exclusion — when set, only certified terms are eligible for
+  retrieval, excluding all non-certified units.
+- Storage is the Zero-Mem SQLite DB at
+  `<projectRoot>/.omp/memory/zero-mem/<dataset>/memory.db`, where `<dataset>`
+  is `<slug>-<hash12>` from `datasetName(cwd)` in `src/zeromem.ts`.
+
+## 8. Four-tier router
+
+The router selects a delegation tier from structural signals (never prompt
+length). Inputs: entity count, cross-module spread, ontology coverage,
+reversibility risk, ambiguity.
+
+Precedence order (mirrors `computeTaskComplexity` in `src/superagent.ts`):
+
+1. `/\b\/plan\b/` in the text, or `agent === "advisor"` → **T4_PREMIER**, reason `premier-advisor`
+2. else agent in `architect|reviewer|security-reviewer|plan-reviewer|harness-proposer|session-orchestrator`, or `ambiguityScore > 0.35`, or `reversibilityRisk >= 0.5` → **T3_DEEP_REASONING**, reason `deep-reasoning-or-risk`
+3. else `crossModuleSpread >= 3`, or agent in `debugger|plan-drafter` → **T2_STANDARD**, reason `cross-module-or-standard`
+4. else → **T1_MECHANICAL**, reason `mechanical-bounded`
+5. after 2+ `degradedRetries`, escalate one tier and append `:escalated` to `reason`
+
+Tier depends on structural signals, never prompt length.
+
+## 9. Unified CLI matrix
+
+| CLI | MCP server | Hooks |
+|---|---|---|
+| OMP CLI (`~/.omp/agent`) | `omp-harness` (`node D:/omp-harness/scripts/omp-harness-mcp.mjs`) | Not applicable — OMP uses its own hook system |
+| Claude CLI (`~/.claude`) | `omp-harness` (`node D:/omp-harness/scripts/omp-harness-mcp.mjs`) | `memory-intake.mjs` (UserPromptSubmit / Stop) |
+
+Claude CLI reaches omp-harness tools **only** through
+`scripts/omp-harness-mcp.mjs`, configured as a stdio MCP server with
+`OMP_HARNESS_JEV=1`, `TYPESAFE_BASE_URL=https://api.ns24.io`,
+`OMP_HARNESS_JEV_MODEL=jev`, and
+`JEV_KEY_FILE=C:/Users/ADMIN/.config/typesafe/key`.

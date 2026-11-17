@@ -30,3 +30,5 @@ probes/
 # OS/editor
 .DS_Store
 Thumbs.db
+.omp/work/
+.omp/memory/

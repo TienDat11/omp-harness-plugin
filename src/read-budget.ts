@@ -288,6 +288,77 @@ function covers(held: ParsedSelector, request: ParsedSelector): boolean {
   });
 }
 
+/**
+ * Line count of a regular file, bounded to {@link MAX_SYMBOL_SCAN_BYTES}.
+ * `undefined` above that cap, where a count would cost more than the hint is worth.
+ *
+ * Deliberately uncached: an `mtimeMs`/`size` guard does not catch a same-size edit
+ * inside one filesystem timestamp tick, and this runs only on a refused read.
+ */
+function fileLineCount(filePath: string, stat: Stats): number | undefined {
+  if (stat.size > MAX_SYMBOL_SCAN_BYTES) return undefined;
+  let text: string;
+  try {
+    text = readFileSync(filePath, "utf8");
+  } catch {
+    return undefined;
+  }
+  let lines = 0;
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) lines++;
+  if (text.length > 0 && !text.endsWith("\n")) lines++;
+  return lines;
+}
+
+/** Parse a {@link selectorKey} form (`lines:1-180`, `lines:1-180:raw`) back into a selector. */
+function parseHeldKey(key: string): ParsedSelector | null {
+  if (key.startsWith("lines:")) return parseSelector(key.slice("lines:".length));
+  if (key === "raw" || key === "img" || key === "conflicts") return parseSelector(key);
+  return null;
+}
+
+/**
+ * Slice of an over-wide request that the held window does not cover, or
+ * `undefined` when the request is already inside the window.
+ *
+ * A request wider than {@link MAX_READ_LINES} is narrowed before the guard looks
+ * for a live copy; when the narrowed prefix is already in context the tail the
+ * model asked for never arrives. Serving that tail keeps the intent and pays
+ * for new bytes only.
+ */
+function uncoveredTail(request: ParsedSelector | null, heldKey: string): string | undefined {
+  if (request === null || request.kind !== "lines" || request.ranges.length !== 1) return undefined;
+  const range = request.ranges[0];
+  if (range.end === undefined) return undefined;
+  const held = parseHeldKey(heldKey);
+  if (held === null || held.kind !== "lines" || held.ranges.length !== 1) return undefined;
+  if (held.raw === true !== (request.raw === true)) return undefined;
+  const heldRange = held.ranges[0];
+  const heldEnd = heldRange.end ?? heldRange.start + MAX_READ_LINES - 1;
+  if (range.start > heldEnd || range.end <= heldEnd) return undefined;
+  const start = Math.max(range.start, heldEnd + 1);
+  const end = Math.min(range.end, start + MAX_READ_LINES - 1);
+  return `${start}-${end}${request.raw === true ? ":raw" : ""}`;
+}
+
+/** Facts and one concrete next call for a refused re-read, so the refusal is actionable. */
+function unreadHint(heldKey: string, totalLines: number | undefined, name: string): string {
+  if (totalLines === undefined) return "";
+  const held = parseHeldKey(heldKey);
+  if (heldKey !== "" && (held === null || held.kind !== "lines")) return "";
+  const total = ` The file has ${totalLines} line${totalLines === 1 ? "" : "s"}.`;
+  if (held !== null && held.kind === "lines") {
+    let heldEnd = 0;
+    for (const range of held.ranges) heldEnd = Math.max(heldEnd, range.end ?? range.start + MAX_READ_LINES - 1);
+    if (totalLines <= heldEnd) return `${total} That window reaches the end of the file.`;
+    const end = Math.min(totalLines, heldEnd + MAX_READ_LINES);
+    return `${total} Lines ${heldEnd + 1}-${totalLines} are not in context; read ${name}:${heldEnd + 1}-${end} for the rest.`;
+  }
+  // A bare read is the tool's own default window, which may itself be capped.
+  if (totalLines <= MAX_READ_LINES) return `${total} That window reaches the end of the file.`;
+  const end = Math.min(totalLines, MAX_READ_LINES * 2);
+  return `${total} Ask for the slice you still need explicitly, e.g. ${name}:${MAX_READ_LINES + 1}-${end}.`;
+}
+
 // ---------------------------------------------------------------------------
 // Live-branch lookup
 // ---------------------------------------------------------------------------
@@ -615,13 +686,18 @@ export function evaluateRead(rawPath: string, cwd: string, branch: readonly unkn
 
   const live = findLiveRead(normalizePathKey(resolved), effective, effectiveKey, scanBranch(branch, cwd), branch, current, cwd);
   if (live) {
+    // The request was narrowed into a window the session already holds: hand back
+    // the tail the model actually asked for instead of refusing the whole call.
+    const tail = uncoveredTail(parsed, live.selector);
+    if (tail !== undefined) return { rewrite: `${split.path}:${tail}` };
     const anchor = live.tag === "" ? split.path : live.tag;
     const shown = live.selector === "" ? "the default window" : live.selector.replace(/^lines:/, "lines ");
     const cap = narrowed === undefined ? "" : ` A read may request at most ${MAX_READ_LINES} lines.`;
+    const hint = unreadHint(live.selector, fileLineCount(resolved, stat), path.basename(split.path));
     const syms = extractFileSymbols(resolved);
     const symSuffix = syms.length > 0 ? ` Symbols in file: ${syms.join(", ")}.` : "";
     return {
-      block: `blocked: ${path.basename(split.path)} (${shown}) is already in context as ${anchor}; reuse it.${cap} Re-reading is allowed once the file changes or that result is pruned.${symSuffix}`,
+      block: `blocked: ${path.basename(split.path)} (${shown}) is already in context as ${anchor}; reuse it.${cap}${hint} Re-reading is allowed once the file changes or that result is pruned.${symSuffix}`,
     };
   }
   if (narrowed === undefined) return undefined;
