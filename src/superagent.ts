@@ -866,14 +866,27 @@ function buildPacketEnrichment(taskText: string, cwd: string, agent?: string): s
   return parts.join("\n");
 }
 
+/** Worker packets carry # Target/# Change/# Acceptance sections (or already hold the contract tag). */
+const WORKER_PACKET_RE = /^\s*#\s*(Target|Change|Acceptance)\b/im;
+
+function isWorkerPacket(text: string): boolean {
+  return WORKER_PACKET_RE.test(text) || text.includes(GOLDFISH_CONTRACT_TAG);
+}
+
 export function resolveSuperagentTaskInput(
   input: Record<string, unknown>,
   state?: SuperagentState,
-  now: number = DEFAULT_NOW(),
+  third?: number | SuperagentMemoryContext | readonly SuperagentMemoryContext[],
   cwd?: string,
 ): Record<string, unknown> | undefined {
+  // Upstream learning branch passes a memory context as the third argument;
+  // our router passes a `now` timestamp. Discriminate by type.
+  if (third !== undefined && typeof third !== "number") {
+    return resolveLearningTaskInput(input, third);
+  }
   const tag = GOLDFISH_CONTRACT_TAG;
   const block = GOLDFISH_CONTRACT_BLOCK;
+  const now: number = typeof third === "number" ? third : DEFAULT_NOW();
 
   const context = typeof input.context === "string" ? input.context : "";
   if (context.includes(tag)) return undefined;
@@ -881,7 +894,7 @@ export function resolveSuperagentTaskInput(
   /** Contract + optional ontology/budget/grammar blocks, in that order. */
   const appendBlocks = (text: string, agent?: string): string => {
     const base = text === "" ? block : `${text}\n\n${block}`;
-    if (!cwd) return base;
+    if (!cwd || !isWorkerPacket(text)) return base;
     const enrichment = buildPacketEnrichment(text, cwd, agent);
     return enrichment === "" ? base : `${base}\n\n${enrichment}`;
   };
@@ -1788,14 +1801,13 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
       const tasks = Array.isArray(scanInput.tasks) ? scanInput.tasks : undefined;
       if (tasks && tasks.length > 0) {
         for (const t of tasks) {
-          if (t && typeof t === "object") {
-            const tc = t as Record<string, unknown>;
-            const assignment = typeof tc.assignment === "string" ? tc.assignment : "";
-            const description = typeof tc.description === "string" ? tc.description : "";
-            const taskPaths = extractTargetPaths(assignment || description);
-            for (const p of taskPaths) {
-              if (!paths.includes(p)) paths.push(p);
-            }
+          if (t && typeof t !== "object") continue;
+          const tc = t as Record<string, unknown>;
+          const assignment = typeof tc.assignment === "string" ? tc.assignment : "";
+          const description = typeof tc.description === "string" ? tc.description : "";
+          const taskPaths = extractTargetPaths(assignment || description);
+          for (const p of taskPaths) {
+            if (!paths.includes(p)) paths.push(p);
           }
         }
       }
@@ -1848,7 +1860,26 @@ export function createSuperagent(pi: ExtensionAPI, deps: SuperagentDeps = {}): v
         try {
           out = runLearningDispatch(toolName, input, learning, identity, cwd, ticket.ticketId, state);
         } catch (err) {
+          // Nothing is dispatched: release the tracked call, drop the assignment,
+          // restore the ticket (a new one becomes "blocked") and undo the main binding.
           pendingToolCalls.delete(`${key}::${identity.callId}`);
+          assignment.status = "dropped";
+          assignment.completedAt = now();
+          if (priorTicket) {
+            ticket.stage = priorTicket.stage;
+            ticket.updatedAt = priorTicket.updatedAt;
+            ticket.allowedPaths = priorTicket.allowedPaths;
+            ticket.targetPaths = priorTicket.targetPaths;
+          } else {
+            ticket.stage = "blocked";
+          }
+          if (priorMain === undefined) {
+            if (ticket.ticketId !== "main") state.tickets.delete("main");
+          } else {
+            priorMain.allowedPaths = priorMainPaths!;
+            priorMain.updatedAt = priorMainUpdatedAt!;
+          }
+          if (shouldPersist(rawCwd)) saveSuperagentSnapshot(cwd, key, state, now());
           return learningBlock(toolName, err instanceof Error ? err.message : String(err));
         }
         return { input: out.final };
