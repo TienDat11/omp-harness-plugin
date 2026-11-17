@@ -241,14 +241,24 @@ const metricsSession = (root: string) => writeJsonl(join(root, "session.jsonl"),
 async function recordWithEnv(sessionFile: string | undefined, wall_ms: number) {
   const dir = tmpDir();
   const prev = process.env.OMP_SESSION_FILE;
-  if (sessionFile === undefined) delete process.env.OMP_SESSION_FILE;
-  else process.env.OMP_SESSION_FILE = sessionFile;
+  const prevAgentDir = process.env.PI_CODING_AGENT_DIR;
+  if (sessionFile === undefined) {
+    delete process.env.OMP_SESSION_FILE;
+    // Isolate the ambient session-dir scan in resolveSessionFile so the test
+    // is hermetic: no leftover ~/.omp/agent/sessions/<project> files can leak in.
+    process.env.PI_CODING_AGENT_DIR = dir;
+  } else {
+    process.env.OMP_SESSION_FILE = sessionFile;
+    delete process.env.PI_CODING_AGENT_DIR;
+  }
   try {
     await harnessRecord(mountTools(), dir, { tier: "S", goal: "g", acceptance: [], models: [], tokens: 1000, wall_ms });
     return JSON.parse(readFileSync(join(dir, "outcome.json"), "utf8")) as { wall_ms: number; metrics?: { activeWallMs: number; cache: { provider?: string; reuse: number }; stopBlocks: { total: number } } };
   } finally {
     if (prev === undefined) delete process.env.OMP_SESSION_FILE;
     else process.env.OMP_SESSION_FILE = prev;
+    if (prevAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = prevAgentDir;
   }
 }
 
