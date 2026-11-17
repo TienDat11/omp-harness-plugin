@@ -23,10 +23,13 @@
   `ns24/deepseek-v4.1-flash:high` / 18; T3_DEEP_REASONING
   `ns24/deepseek-v4.1-flash:max` / 24; T4_PREMIER
   `openai-codex/gpt-6-luna:max` / 24; escalates one tier after 2 degraded
-  retries. `resolveSuperagentTaskInput(input, state, now, cwd?)` appends
-  `<ontology-context>`, `<compute-budget>`, `<output-grammar>` after the
-  worker contract, only when `cwd` is supplied, and stays idempotent via the
-  contract tag.
+  retries. `resolveSuperagentTaskInput(input, state?, third?, cwd?)` routes a
+  third arg that is either a memory context (upstream learning dispatch,
+  discriminated by type) or a `now` timestamp, then appends
+  `<ontology-context>`, `<compute-budget>`, `<output-grammar>` after the worker
+  contract only when `cwd` is supplied and `isWorkerPacket(text)` — i.e. the text
+  carries `# Target`/`# Change`/`# Acceptance` or the contract tag. Idempotent
+  via the contract tag.
 - Claude CLI activation: `scripts/omp-harness-mcp.mjs` is a stdio JSON-RPC 2.0
   MCP server exposing 11 tools (`jev_decide`, `jev_rank`, `jev_gate`,
   `intake_open`, `harness_record`, `harness_mine`, `harness_gate`,
